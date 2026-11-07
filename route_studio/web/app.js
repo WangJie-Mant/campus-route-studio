@@ -55,6 +55,7 @@
     $('motion-period').value = motion.period ?? 10;
     $('motion-sway').value = motion.sway ?? 0;
     $('motion-sway-period').value = motion.swayPeriod ?? 4;
+    restoreTrackSettings(motion);
     $('library-name').value = entry.name;
     changeCount++;
     renderRoute(true);
@@ -98,7 +99,8 @@
     preview: '先预览路线与速度。预览模式不会向设备发送定位数据。',
     android: '通过 USB 调试直接连接 Android，手机不安装 APK。开始时验证系统定位通道，结束时移除临时定位。',
     mumu: '通过本机 MuMu 管理器发送定位。不需要定位助手，支持情况取决于管理器版本。',
-    ios: '通过 USB 与 iOS 开发者服务跑步定位。需要匹配系统版本的开发环境，无法保证所有 iOS 版本可用。',
+    ios: '通过 USB 回放经纬度。当前 iOS 通道不发送速度、精度或运动数据，位置移动不能证明乐跑已记录轨迹。',
+    harmony: '实验性 HarmonyOS 7+ 通道，使用华为官方定位调试工具发送经纬度、速度和方向。实际支持取决于设备服务，尚未通过真机验收。',
     avd: '面向 Android Studio 官方模拟器。可用模拟器控制台同时模拟定位与运动传感器数据。'
   };
   const DEFAULT_POINTS = [{lat:29.51264659,lon:106.69253011},{lat:29.51204124,lon:106.69388141},{lat:29.51191977,lon:106.69394581},{lat:29.51175158,lon:106.69396727},{lat:29.51162077,lon:106.69392434},{lat:29.51150865,lon:106.69381701},{lat:29.51145258,lon:106.69364529},{lat:29.51148061,lon:106.69348430},{lat:29.51214402,lon:106.69223932},{lat:29.51222811,lon:106.69211053},{lat:29.51236827,lon:106.69209980},{lat:29.51254580,lon:106.69212126},{lat:29.51264858,lon:106.69217493},{lat:29.51264659,lon:106.69253011}];
@@ -107,6 +109,12 @@
   let routeLayer = null;
   let markerLayer = null;
   let playbackMarker = null;
+  let traceLayers = [];
+  let tracePoints = [];
+  let traceRunId = null;
+  let traceCursor = 0;
+  let traceTruncated = false;
+  let staticPreview = null;
   let run = {state: 'idle', elapsed: 0, distance: 0, totalDistance: 0, duration: 0, point: null};
   let busy = false;
   let deviceBusy = false;
@@ -121,8 +129,8 @@
 
   // ---- 设置自动保存：改完即存，下次打开自动恢复 ----
   const MOTION_MODES = new Set(['fixed', 'smooth', 'alternating']);
-  const OUTPUT_MODES = new Set(['preview', 'android', 'mumu', 'ios', 'avd']);
-  const DEFAULT_SETTINGS = {'speed': 2.5, 'loop-mode': 'finite', 'loops': 1, 'motion-mode': 'fixed', 'motion-low': 2, 'motion-high': 3, 'motion-period': 10, 'motion-sway': 0, 'motion-sway-period': 4, 'live-speed': 2.5};
+  const OUTPUT_MODES = new Set(['preview', 'android', 'mumu', 'ios', 'avd', 'harmony']);
+  const DEFAULT_SETTINGS = {'speed': 2.5, 'loop-mode': 'finite', 'loops': 1, 'motion-mode': 'fixed', 'motion-low': 2, 'motion-high': 3, 'motion-period': 10, 'motion-sway': 0, 'motion-sway-period': 4, 'motion-random-offset': 2, 'motion-random-spacing': 30, 'live-speed': 2.5};
   let autoSaveTimer = null;
   let autoSaveFailed = false;
 
@@ -134,6 +142,12 @@
   function validInteger(value, minimum, maximum) {
     const result = Number(value);
     return Number.isInteger(result) && result >= minimum && result <= maximum ? result : null;
+  }
+
+  function restoreTrackSettings(motion) {
+    // Replace the retired large-drift settings, including old browser/route-library saves.
+    $('motion-random-offset').value = validNumber(motion.randomOffset, 0, 5) ?? 2;
+    $('motion-random-spacing').value = motion.randomStyle === 'track-band-v1' ? (validNumber(motion.randomSpacing, 10, 100) ?? 30) : 30;
   }
 
   function fieldNumber(id, minimum, maximum, fallback) {
@@ -173,12 +187,16 @@
         high: Math.max(low, high),
         period: fieldNumber('motion-period', 2, 120, 10),
         sway: fieldNumber('motion-sway', 0, 3, 0),
-        swayPeriod: fieldNumber('motion-sway-period', 2, 30, 4)
+        swayPeriod: fieldNumber('motion-sway-period', 2, 30, 4),
+        randomOffset: fieldNumber('motion-random-offset', 0, 5, 2),
+        randomSpacing: fieldNumber('motion-random-spacing', 10, 100, 30),
+        randomStyle: 'track-band-v1'
       },
       ui: {
         mode: OUTPUT_MODES.has($('mode').value) ? $('mode').value : 'preview',
         adbAddress: $('adb-address').value.trim().slice(0, 255),
         manager: $('manager').value.trim().slice(0, 500),
+        hdcPath: $('hdc-path').value.trim().slice(0, 500),
         instance: fieldInteger('instance', 0, 9999, 0),
         sensor: $('sensor').checked,
         followPlayback
@@ -256,6 +274,7 @@
         const value = validNumber(motion[key], minimum, maximum);
         if (value !== null) $(id).value = value;
       }
+      restoreTrackSettings(motion);
       restored = true;
     }
     const ui = saved.ui;
@@ -263,6 +282,7 @@
       if (OUTPUT_MODES.has(ui.mode)) $('mode').value = ui.mode;
       if (typeof ui.adbAddress === 'string') $('adb-address').value = ui.adbAddress.slice(0, 255);
       if (typeof ui.manager === 'string') $('manager').value = ui.manager.slice(0, 500);
+      if (typeof ui.hdcPath === 'string') $('hdc-path').value = ui.hdcPath.slice(0, 500);
       const instance = validInteger(ui.instance, 0, 9999);
       if (instance !== null) $('instance').value = instance;
       $('sensor').checked = ui.sensor === true;
@@ -283,9 +303,11 @@
   }
 
   function motionSettings() {
-    const result = {mode: $('motion-mode').value, speed: Number($('live-speed').value), low: Number($('motion-low').value), high: Number($('motion-high').value), period: Number($('motion-period').value), sway: Number($('motion-sway').value), swayPeriod: Number($('motion-sway-period').value)};
+    const result = {mode: $('motion-mode').value, speed: Number($('live-speed').value), low: Number($('motion-low').value), high: Number($('motion-high').value), period: Number($('motion-period').value), sway: Number($('motion-sway').value), swayPeriod: Number($('motion-sway-period').value), randomOffset: Number($('motion-random-offset').value), randomSpacing: Number($('motion-random-spacing').value), randomStyle: 'track-band-v1'};
     if (Object.values(result).some(v => typeof v === 'number' && !Number.isFinite(v))) throw new Error('运动参数必须填写有效数字。');
     if (result.low > result.high) throw new Error('最低速度不能大于最高速度。');
+    if (result.randomOffset < 0 || result.randomOffset > 5) throw new Error('贴线偏移上限应为 0 到 5 米。');
+    if (result.randomSpacing < 10 || result.randomSpacing > 100) throw new Error('局部变化间距应为 10 到 100 米。');
     return result;
   }
   $('speed').addEventListener('input', () => { if (!isActive()) $('live-speed').value = $('speed').value; });
@@ -473,7 +495,7 @@
       $('pace').textContent = '—';
       $('estimated-duration').textContent = '—';
     }
-    if (run.state === 'idle') $('progress-distance').textContent = `0 / ${distanceText(distance * (loops > 0 ? loops : 1))}`;
+    if (!run.mode) $('progress-distance').textContent = `0 / ${distanceText(distance * (loops > 0 ? loops : 1))}`;
     updateControls();
   }
 
@@ -505,6 +527,7 @@
   }
 
   function renderRoute(fit = false) {
+    invalidateStaticPreview();
     const list = $('waypoints');
     list.replaceChildren();
     if (!points.length) {
@@ -571,22 +594,102 @@
       return;
     }
     const initial = toMap({lat: 30.2741, lon: 120.1551});
-    map = L.map('map', {zoomControl: false, attributionControl: true, preferCanvas: true, worldCopyJump: true}).setView([initial.lat, initial.lon], 15);
+    map = L.map('map', {zoomControl: false, attributionControl: true, preferCanvas: true, worldCopyJump: true, zoomSnap: 0.25}).setView([initial.lat, initial.lon], 15);
     L.control.zoom({position: 'topright'}).addTo(map);
     const school = savedSchool();
     $('school-button').disabled = !school;
     if (school) { const p = toMap(school); map.setView([p.lat, p.lon], Math.max(1, Math.min(19, school.zoom || 16))); }
     CampusBasemap.attach(map, {onFallback: message => notify(message), onUnavailable: value => { $('map-offline').hidden = !value; }});
-    routeLayer = L.polyline([], {color: '#0d746b', weight: 4, opacity: 0.88, lineJoin: 'round', lineCap: 'round'}).addTo(map);
+    routeLayer = L.polyline([], {color: '#0d746b', weight: 2, opacity: 0.65, dashArray: '5 4', lineJoin: 'round', lineCap: 'round'}).addTo(map);
+    traceLayers = ['#d65f20', '#7463ba', '#c33e71'].map(color => L.polyline([], {color, weight: 1.3, opacity: 0.85, interactive: false, className: 'simulated-trace'}).addTo(map));
     markerLayer = L.layerGroup().addTo(map);
     map.on('click', (event) => addPoint(fromMap({lat: event.latlng.lat, lon: event.latlng.lng})));
     if (window.ResizeObserver) new ResizeObserver(() => map.invalidateSize()).observe($('map'));
   }
 
+  function drawTrace() {
+    const groups = traceLayers.map(() => []);
+    let segment = null, previous = null;
+    for (const point of tracePoints) {
+      const display = toMap(point);
+      const position = [display.lat, display.lon];
+      if (!previous || point.lap !== previous.lap || point.seq !== previous.seq + 1) {
+        segment = [];
+        if (previous && point.seq === previous.seq + 1) {
+          const last = toMap(previous); segment.push([last.lat, last.lon]);
+        }
+        if (groups.length) groups[point.lap % groups.length].push(segment);
+      }
+      segment.push(position);
+      previous = point;
+    }
+    traceLayers.forEach((layer, index) => layer.setLatLngs(groups[index]));
+    $('fit-trace-button').disabled = tracePoints.length === 0 || !map;
+    const node = $('trace-status');
+    node.dataset.points = String(tracePoints.length);
+    node.textContent = staticPreview ? `仅模拟 · ${staticPreview.laps} 圈贴线轨迹 · 最大偏离 ${staticPreview.maxOffset.toFixed(2)} 米 · 未连接手机。下次运行会生成新的细微变化。` : tracePoints.length ? `已绘制 ${tracePoints.length} 个模拟定位点 · 按圈交替着色${traceTruncated ? ' · 仅保留最近 20000 点' : ''}。停止后保留，开始新任务时清空。` : '开始预览后，逐步绘出实际模拟轨迹。';
+  }
+
+  async function refreshTrace() {
+    if (staticPreview && !isActive()) return;
+    if (staticPreview) { staticPreview = null; traceRunId = null; traceCursor = 0; }
+    if (!run.runId || (run.runId === traceRunId && run.sentUpdates <= traceCursor)) return;
+    try {
+      const data = await api('/api/trace', {runId: traceRunId, after: traceCursor});
+      if (staticPreview && !isActive()) return;
+      if (data.runId !== run.runId) return;
+      if (data.reset || traceRunId !== data.runId) {
+        tracePoints = []; traceCursor = 0; traceTruncated = false;
+      }
+      traceRunId = data.runId;
+      traceTruncated ||= Boolean(data.truncated);
+      for (const point of data.points || []) {
+        if (point.seq <= traceCursor || !Number.isFinite(point.lat) || !Number.isFinite(point.lon)) continue;
+        tracePoints.push(point); traceCursor = point.seq;
+      }
+      if (tracePoints.length > 20000) { tracePoints = tracePoints.slice(-20000); traceTruncated = true; }
+      drawTrace();
+    } catch (error) {
+      $('trace-status').textContent = `模拟轨迹暂未同步：${error.message}。定位发送仍由后台控制。`;
+    }
+  }
+
+  function invalidateStaticPreview() {
+    if (!staticPreview) return;
+    staticPreview = null; tracePoints = [];
+    // Keep a previous stopped task from replacing a newly edited preview.
+    traceRunId = run.runId || null; traceCursor = run.sentUpdates || 0;
+    drawTrace();
+    $('trace-status').textContent = '路线或参数已更改，请重新快速预览。';
+  }
+
+  $('fit-trace-button').addEventListener('click', () => {
+    if (!map || !tracePoints.length) return;
+    const bounds = L.latLngBounds(tracePoints.map(point => { const p = toMap(point); return [p.lat, p.lon]; }));
+    if (routeLayer) bounds.extend(routeLayer.getBounds());
+    map.fitBounds(bounds, {paddingTopLeft: [110, 60], paddingBottomRight: [35, 35], maxZoom: 20, animate: false});
+    setFollow(false); saveNow();
+  });
+
+  $('quick-preview-button').addEventListener('click', () => action(async () => {
+    if (isActive() || $('mode').value !== 'preview') return;
+    const data = await api('/api/preview/track', {route: settings(), motion: motionSettings()});
+    staticPreview = data;
+    tracePoints = data.points || []; traceTruncated = false;
+    traceRunId = null; traceCursor = 0;
+    drawTrace();
+    $('fit-trace-button').click();
+    notify('已生成 8 圈贴线模拟轨迹，未启动手机定位；各圈只在原路线附近细微变化。');
+  }));
+
   function updateControls() {
     const active = isActive();
     const locked = editingLocked();
+    $('quick-preview-button').hidden = $('mode').value !== 'preview';
+    $('quick-preview-button').disabled = locked || points.length < 2 || !serverOnline;
     $('loop-mode').disabled = locked;
+    $('motion-random-offset').disabled = locked;
+    $('motion-random-spacing').disabled = locked;
     $('loop-hint').textContent = $('loop-mode').value === 'infinite' ? '路线自动闭合，持续跑步直到点击停止；不会因完成一圈而退出。' : '跑完指定圈数后自动停止。';
     const librarySelected = Boolean($('library-select').value);
     $('library-refresh').disabled = libraryBusy;
@@ -595,7 +698,8 @@
     $('library-update').disabled = libraryBusy || busy || !librarySelected || points.length < 2;
     $('library-delete').disabled = libraryBusy || !librarySelected;
     $('apply-motion').disabled = busy || !['running', 'paused', 'starting'].includes(run.state);
-    ['latitude', 'longitude', 'speed', 'loops', 'mode', 'demo-button', 'import-button', 'load-button', 'android-device', 'ios-device', 'manager', 'instance', 'sensor', 'adb-address'].forEach(id => { $(id).disabled = locked; });
+    ['latitude', 'longitude', 'speed', 'loops', 'mode', 'demo-button', 'import-button', 'load-button', 'android-device', 'ios-device', 'harmony-device', 'hdc-path', 'manager', 'instance', 'sensor', 'adb-address'].forEach(id => { $(id).disabled = locked; });
+    ['harmony-probe', 'harmony-clear'].forEach(id => { $(id).disabled = locked || deviceBusy || !$('harmony-device').value; });
     $('loops').disabled = locked || $('loop-mode').value === 'infinite';
     document.querySelector('.add-button').disabled = locked;
     document.querySelectorAll('.waypoint-remove').forEach(button => { button.disabled = locked; });
@@ -612,6 +716,7 @@
     $('pause-button').disabled = busy || !['running', 'paused'].includes(run.state);
     $('pause-button').textContent = run.state === 'paused' ? '继续' : '暂停';
     $('stop-button').disabled = busy || !['starting', 'running', 'paused'].includes(run.state);
+    $('diagnostics-export').disabled = busy || !run.mode;
     $('map-mode-label').textContent = active ? '路线已锁定' : '路线编辑';
     $('map-tip').lastChild.textContent = active ? '路线跑步中 · 停止后可继续编辑' : '点击地图添加路线点 · 拖动标记调整位置';
     if (markerLayer) markerLayer.eachLayer(marker => {
@@ -627,14 +732,14 @@
     const total = Math.max(0, finite(run.totalDistance));
     const distance = Math.max(0, finite(run.distance));
     const percentage = total > 0 ? Math.min(100, Math.max(0, distance / total * 100)) : 0;
-    $('run-state').textContent = STATE_LABELS[run.state];
+    $('run-state').textContent = run.state === 'idle' && run.mode ? '已停止' : STATE_LABELS[run.state];
     $('run-state').dataset.state = run.state;
     $('progress-percent').replaceChildren(document.createTextNode(String(Math.floor(percentage))));
     const percentSymbol = document.createElement('span'); percentSymbol.textContent = '%'; $('progress-percent').append(percentSymbol);
     $('progress-fill').style.width = `${percentage}%`;
     $('progress-track').setAttribute('aria-valuenow', String(Math.round(percentage)));
-    $('progress-distance').textContent = run.state === 'idle' ? `0 / ${distanceText(routeDistance() * finite($('loops').value, 1))}` : `${distanceText(distance)} / ${distanceText(total)}`;
-    if (run.infinite && run.state !== 'idle') {
+    $('progress-distance').textContent = !run.mode ? `0 / ${distanceText(routeDistance() * finite($('loops').value, 1))}` : `${distanceText(distance)} / ${distanceText(total)}`;
+    if (run.infinite && run.mode) {
       const lapPercent = run.lapDistance > 0 ? (distance % run.lapDistance) / run.lapDistance * 100 : 0;
       $('progress-percent').textContent = '∞';
       $('progress-fill').style.width = `${lapPercent}%`;
@@ -643,14 +748,16 @@
       $('progress-distance').textContent = `${distanceText(distance)} · 已完成 ${run.completedLaps || 0} 圈`;
     } else {
       $('progress-track').removeAttribute('aria-valuetext');
-      if (run.state === 'idle' && $('loop-mode').value === 'infinite') $('progress-distance').textContent = '无限循环 · 手动停止';
+      if (!run.mode && $('loop-mode').value === 'infinite') $('progress-distance').textContent = '无限循环 · 手动停止';
     }
     $('elapsed-time').textContent = clockText(run.elapsed);
-    $('live-speed-status').textContent = run.point ? `当前沿路线速度：${Number(run.point.speed || 0).toFixed(2)} m/s · 变速时预计时长仅供参考` : '当前速度：—';
-    $('ios-motion-note').hidden = $('mode').value !== 'ios';
+    const speed = Number(run.point?.speed || 0);
+    const pace = speed > 0 ? clockText(1000 / speed) + ' /公里' : '—';
+    $('live-speed-status').textContent = run.point ? `工具计算速度：${speed.toFixed(2)} m/s · 配速 ${pace}（非乐跑回传）` : '工具计算速度：—';
+    renderTransmission();
     const sent = Number.isFinite(run.sentUpdates) ? run.sentUpdates : null;
     const age = run.lastSendTime ? Math.max(0, (Date.now() / 1000) - run.lastSendTime) : null;
-    $('send-diagnostics').textContent = run.state === 'idle' ? '开始跑步后显示坐标发送状态。' : sent === null ? '当前后台尚未支持发送诊断，请停止跑步后重新启动 start.cmd。' : `已发送 ${sent} 次坐标${age === null ? ' · 等待首次发送' : ` · 上次发送 ${Math.floor(age)} 秒前 · 耗时 ${run.lastSendMs || 0} 毫秒`}。接口发送成功不等于手机地图已确认更新。`;
+    $('send-diagnostics').textContent = !run.mode ? '开始跑步后显示坐标发送状态。' : sent === null ? '当前后台尚未支持发送诊断，请停止跑步后重新启动 start.cmd。' : `已${run.mode === 'preview' ? '预览' : '发送'} ${sent} 次坐标${age === null ? ' · 等待首次发送' : ` · 上次${isActive() ? '发送' : '更新'} ${Math.floor(age)} 秒前 · 耗时 ${run.lastSendMs || 0} 毫秒`}。${run.mode === 'preview' ? '预览模式未向手机发送。' : '接口发送成功不等于手机或乐跑确认接收。'}`;
     if (run.point && Number.isFinite(run.point.lat) && Number.isFinite(run.point.lon)) {
       $('current-position').textContent = `${run.point.lat.toFixed(7)}, ${run.point.lon.toFixed(7)}`;
       if (map) {
@@ -664,10 +771,23 @@
       $('current-position').textContent = '—';
       if (map && playbackMarker) { map.removeLayer(playbackMarker); playbackMarker = null; }
     }
-    if (run.error && run.error !== lastRunError) { lastRunError = run.error; notify(`启动跑步失败：${run.error}`, true); }
+    if (run.error && run.error !== lastRunError) { lastRunError = run.error; notify(`定位回放失败：${run.error}`, true); }
     if (run.cleanupError && run.cleanupError !== lastCleanupError) { lastCleanupError = run.cleanupError; notify(`停止后的设备清理未完成：${run.cleanupError}\n请在设备上检查定位是否恢复。`, true); }
-    if (previousState !== 'completed' && run.state === 'completed' && !run.cleanupError) notify('本次跑步已完成。设备模式下，请在设备上核对定位恢复情况。');
+    if (previousState !== 'completed' && run.state === 'completed' && !run.cleanupError) notify('本次路线回放已完成。设备模式下，请在设备上核对定位恢复情况。');
     updateControls();
+  }
+
+  function renderTransmission() {
+    $('ios-motion-note').hidden = (isActive() ? run.mode : $('mode').value) !== 'ios';
+    const node = $('transmission-diagnostics');
+    const stats = run.transmission;
+    if (!stats) { node.textContent = ''; node.dataset.warning = 'false'; return; }
+    const age = run.lastSendTime ? Math.max(0, Date.now() / 1000 - run.lastSendTime) : 0;
+    const stalled = isActive() && age * 1000 > stats.gapThresholdMs;
+    const interval = stats.lastIntervalMs == null ? '等待第二次更新' : `${(stats.lastIntervalMs / 1000).toFixed(2)} 秒`;
+    const maxInterval = stats.maxIntervalMs == null ? '—' : `${(stats.maxIntervalMs / 1000).toFixed(2)} 秒`;
+    node.textContent = `${stalled ? '长时间未成功更新，请检查连接。' : ''}坐标累计位移 ${distanceText(stats.sentDistance || 0)} · 最近间隔 ${interval} · 最长间隔 ${maxInterval} · 超过 ${(stats.gapThresholdMs / 1000).toFixed(1)} 秒 ${stats.longGaps || 0} 次。统计来自工具发送端。`;
+    node.dataset.warning = String(stalled || stats.longGaps > 0);
   }
 
   function refreshStatus() {
@@ -680,6 +800,7 @@
         $('connection-dot').classList.add('connected');
         $('app-version').textContent = data.info && data.info.version ? `v${data.info.version}` : '';
         if (data.run) renderStatus(data.run);
+        await refreshTrace();
       } catch (error) {
         serverOnline = false;
         $('server-status').textContent = '本机服务连接中断';
@@ -696,14 +817,25 @@
     const avdOnly = $('mode').value === 'avd';
     const previousAndroid = $('android-device').value;
     const previousIos = $('ios-device').value;
+    const previousHarmony = $('harmony-device').value;
     $('android-device').replaceChildren(new Option('请选择已连接设备', ''));
     $('ios-device').replaceChildren(new Option('请选择已连接设备', ''));
+    $('harmony-device').replaceChildren(new Option('请选择已连接设备', ''));
     (deviceData.android || []).filter(device => !avdOnly || String(device.serial).startsWith('emulator-')).forEach(device => {
       const option = new Option(`${device.model || device.serial}${device.model ? ` · ${device.serial}` : ''}${device.state !== 'device' ? ` (${device.state})` : ''}`, device.serial);
       option.disabled = device.state !== 'device';
       $('android-device').append(option);
     });
     (deviceData.ios || []).forEach(device => { $('ios-device').append(new Option(`${device.name || 'iOS 设备'}${device.version ? ` · ${device.version}` : ''} · ${String(device.udid).slice(0, 8)}…`, device.udid)); });
+    (deviceData.harmony || []).forEach(device => {
+      const option = new Option(`${device.name || '鸿蒙设备'} · ${device.target} · ${device.state}`, device.target);
+      option.disabled = !['connected', 'ready'].includes(String(device.state).toLowerCase());
+      $('harmony-device').append(option);
+    });
+    if (Array.from($('harmony-device').options).some(option => option.value === previousHarmony && !option.disabled)) $('harmony-device').value = previousHarmony;
+    const harmonyAvailable = Array.from($('harmony-device').options).filter(option => option.value && !option.disabled);
+    if (!$('harmony-device').value && harmonyAvailable.length === 1) $('harmony-device').value = harmonyAvailable[0].value;
+    if (deviceData.hdcPath && !$('hdc-path').value.trim()) { $('hdc-path').value = deviceData.hdcPath; saveNow(); }
     if (Array.from($('android-device').options).some(option => option.value === previousAndroid && !option.disabled)) $('android-device').value = previousAndroid;
     if (Array.from($('ios-device').options).some(option => option.value === previousIos)) $('ios-device').value = previousIos;
     const androidAvailable = Array.from($('android-device').options).filter(option => option.value && !option.disabled);
@@ -719,7 +851,8 @@
       if (!deviceData.dependencies?.ios) messages.push('iPhone 扫描依赖未安装到当前 Python。请退出后用 start.cmd 重新启动；Apple 驱动已安装也需要此依赖。');
       else if (!$('ios-device').options[1]) messages.push('未发现 iOS 设备。请使用数据线连接、解锁并信任此电脑。');
     }
-    if (['android', 'ios', 'avd'].includes(mode)) (deviceData.errors || []).forEach(error => { messages.push(typeof error === 'string' ? error : error.message || JSON.stringify(error)); });
+    if (mode === 'harmony' && !harmonyAvailable.length) messages.push('未发现已授权鸿蒙 USB 设备，请连接并解锁手机、开启 USB 调试，在手机允许此电脑连接。');
+    if (['android', 'ios', 'avd', 'harmony'].includes(mode)) (deviceData.errors || []).forEach(error => { messages.push(typeof error === 'string' ? error : error.message || JSON.stringify(error)); });
     $('device-notice').textContent = messages.join('\n');
     $('device-notice').hidden = !messages.length;
     updateControls();
@@ -730,7 +863,7 @@
     deviceBusy = true;
     updateControls();
     try {
-      deviceData = await api('/api/devices', undefined, 60000);
+      deviceData = $('mode').value === 'harmony' ? await api('/api/harmony/devices', {hdcPath: $('hdc-path').value.trim()}, 60000) : await api('/api/devices', undefined, 60000);
       populateDevices();
     } catch (error) { notify(error.message, true); }
     finally { deviceBusy = false; updateControls(); }
@@ -743,13 +876,15 @@
     $('android-helper').hidden = mode !== 'android';
     $('adb-connect').hidden = mode !== 'android';
     $('ios-fields').hidden = mode !== 'ios';
+    $('harmony-fields').hidden = mode !== 'harmony';
     $('mumu-fields').hidden = mode !== 'mumu';
     $('sensor-field').hidden = mode !== 'avd';
     if (mode !== 'avd') $('sensor').checked = false;
+    renderTransmission();
     $('device-notice').hidden = true;
     populateDevices();
     updateControls();
-    if (['android', 'avd', 'ios'].includes(mode)) refreshDevices();
+    if (['android', 'avd', 'ios', 'harmony'].includes(mode)) refreshDevices();
   }
 
   function downloadText(filename, text, mime) {
@@ -763,6 +898,12 @@
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+
+  $('diagnostics-export').addEventListener('click', () => action(async () => {
+    const report = await api('/api/diagnostics');
+    downloadText('campus-route-diagnostics.json', JSON.stringify(report, null, 2), 'application/json');
+    notify('已导出发送端诊断；报告不包含路线坐标和设备标识，乐跑接收状态仍需在手机核对。');
+  }));
 
   $('coordinate-form').addEventListener('submit', (event) => {
     event.preventDefault();
@@ -801,7 +942,9 @@
   $('android-device').addEventListener('change', updateControls);
   document.querySelectorAll('.refresh-button').forEach(button => button.addEventListener('click', refreshDevices));
   // 连续输入：合并成一次写入，避免每敲一个键就把整条路线序列化一遍。
-  ['speed', 'loops', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'live-speed', 'manager', 'instance', 'adb-address'].forEach(id => $(id).addEventListener('input', scheduleSave));
+  ['speed', 'loops', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'motion-random-offset', 'motion-random-spacing', 'live-speed', 'manager', 'hdc-path', 'instance', 'adb-address'].forEach(id => $(id).addEventListener('input', scheduleSave));
+  ['speed', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'motion-random-offset', 'motion-random-spacing', 'live-speed'].forEach(id => $(id).addEventListener('input', invalidateStaticPreview));
+  $('motion-mode').addEventListener('change', invalidateStaticPreview);
   // 离散操作：改完立即写盘，不等防抖。
   ['loop-mode', 'motion-mode', 'export-format', 'sensor'].forEach(id => $(id).addEventListener('change', saveNow));
   window.addEventListener('pagehide', flushSave);
@@ -812,6 +955,13 @@
     notify('正在检测安卓直连能力，手机不安装 APK…');
     const data = await api('/api/android/probe', {serial}, 120000);
     notify(data.message || '安卓直连基础检测通过。请开启手机定位，开始后核对实际位置。');
+  }));
+  $('harmony-device').addEventListener('change', updateControls);
+  for (const operation of ['probe', 'clear']) $('harmony-' + operation).addEventListener('click', () => action(async () => {
+    const target = $('harmony-device').value;
+    if (!target) throw new Error('请先选择一台已授权的鸿蒙 USB 设备。');
+    const data = await api('/api/harmony/' + operation, {target, hdcPath: $('hdc-path').value.trim()}, 60000);
+    notify(data.message);
   }));
   $('connect-button').addEventListener('click', () => action(async () => {
     const address = $('adb-address').value.trim();
@@ -831,6 +981,11 @@
     if (mode === 'ios') {
       payload.udid = $('ios-device').value;
       if (!payload.udid) throw new Error('请先刷新并选择一台 iOS 设备。');
+    }
+    if (mode === 'harmony') {
+      payload.target = $('harmony-device').value;
+      payload.hdcPath = $('hdc-path').value.trim();
+      if (!payload.target) throw new Error('请先刷新并选择一台鸿蒙 USB 设备。');
     }
     if (mode === 'mumu') {
       payload.manager = $('manager').value.trim();
@@ -913,6 +1068,7 @@
   $('reset-settings-button').addEventListener('click', () => {
     if (!window.confirm('恢复默认跑步设置？当前路线会保留。')) return;
     Object.entries(DEFAULT_SETTINGS).forEach(([id, value]) => { $(id).value = value; });
+    invalidateStaticPreview();
     setFollow(false);
     $('sensor').checked = false;
     updateEstimates();

@@ -39,3 +39,12 @@
 .library-actions button {flex:1;padding:0 7px;}
 .leaflet-control-layers input {width:auto;height:auto;min-height:0;display:inline-block;padding:0;margin:0 5px 0 0;}
 .leaflet-control-layers label {display:flex;align-items:center;min-height:26px;margin:0;font-size:12px;}
+.ios-diagnostics {margin-top:14px;padding:12px;background:#fff8e8;border:1px solid #e7d4a2;border-radius:10px;font-size:12px;line-height:1.8;color:#66512b;}
+.ios-diagnostics p {margin:7px 0;}
+.ios-diagnostics summary {cursor:pointer;}
+.ios-diagnostics ol {padding-left:20px;margin:8px 0;}
+.ios-diagnostics li+li {margin-top:8px;}
+#transmission-diagnostics[data-warning="true"] {color:#9c4b13;}
+.trace-status {margin:0;padding:10px 14px;border-top:1px solid #e3e9dd;font-size:11px;line-height:1.7;color:var(--muted);}
+.trace-legend {background:#d65f20!important;}
+#quick-preview-button {margin-top:8px;}

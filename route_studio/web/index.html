@@ -45,6 +45,9 @@
           <div class="form-grid"><label>最低速度 m/s<input id="motion-low" type="number" min="0.2" max="20" step="0.1" value="2"></label><label>最高速度 m/s<input id="motion-high" type="number" min="0.2" max="20" step="0.1" value="3"></label></div>
           <label>快慢完整周期（秒）<input id="motion-period" type="number" min="2" max="120" value="10"></label>
           <div class="form-grid"><label>左右摆幅（米）<input id="motion-sway" type="number" min="0" max="3" step="0.1" value="0"></label><label>摆动周期（秒）<input id="motion-sway-period" type="number" min="2" max="30" value="4"></label></div>
+          <label>贴线偏移上限（米，0 关闭）<input id="motion-random-offset" type="number" min="0" max="5" step="0.1" value="2"></label>
+          <label>局部变化间距（米）<input id="motion-random-spacing" type="number" min="10" max="100" step="1" value="30"></label>
+          <p class="field-hint">默认左右最多 2 米，沿标定路线形成窄幅轨迹带；各圈有细微差异，弯道也贴线。建议 1–3 米。偏移启用时，左右摆动也限制在此范围内。</p>
           <label>实时基础速度 m/s<input id="live-speed" type="number" min="0.2" max="20" step="0.1" value="2.5"></label>
           <button id="apply-motion" class="secondary-button full-width" type="button">应用到本次跑步</button>
           <p class="field-hint">非固定模式使用最低 / 最高速度；左右摆动为路线偏移，0 表示关闭，不是手机传感器数据。</p>
@@ -72,18 +75,20 @@
           <button class="secondary-button" id="save-school-button" type="button">保存学校位置</button>
           <button class="secondary-button" id="school-button" type="button">回到学校</button>
           <button class="secondary-button" id="follow-button" type="button" aria-pressed="false">跟随位置：关</button>
+          <button class="secondary-button" id="fit-trace-button" type="button" disabled>查看全部轨迹</button>
           <span id="location-status" role="status" aria-live="polite">定位使用电脑位置；保存以地图中心为准</span>
         </div>
         <div id="map" aria-label="点击添加路线点的交互地图" tabindex="0"></div>
         <div class="map-offline" id="map-offline" hidden>地图底图暂不可用。仍可通过左侧坐标输入、导入与导出编辑路线。</div>
         <div class="map-tip" id="map-tip"><span class="tip-dot"></span>点击地图添加路线点 · 拖动标记调整位置</div>
-        <div class="map-footer"><span><i class="legend-line"></i>规划路线</span><span><i class="legend-point"></i>当前跑步位置</span><span class="map-network">底图需要联网</span></div>
+        <div class="map-footer"><span><i class="legend-line"></i>规划路线</span><span><i class="legend-line trace-legend"></i>模拟轨迹（分圈着色）</span><span><i class="legend-point"></i>当前跑步位置</span><span class="map-network">底图需要联网</span></div>
+        <p id="trace-status" class="trace-status" aria-live="polite" data-points="0">开始预览后，逐步绘出实际模拟轨迹。</p>
       </section>
 
       <aside class="panel device-panel" aria-labelledby="device-title">
         <div class="panel-heading"><div><span class="eyebrow">02 / RUN</span><h2 id="device-title">连接设备与跑步</h2></div><span class="connection-dot" id="connection-dot" aria-hidden="true"></span></div>
         <label class="field-label" for="mode">连接方式</label>
-        <select id="mode"><option value="preview">仅在地图预览</option><option value="android">Android（USB 直连，免安装 APK）</option><option value="mumu">MuMu（管理器定位）</option><option value="ios">iPhone / iPad（USB）</option><option value="avd">Android 官方模拟器（AVD）</option></select>
+        <select id="mode"><option value="preview">仅在地图预览</option><option value="android">Android（USB 直连，免安装 APK）</option><option value="harmony">鸿蒙 7+（USB 调试，实验性）</option><option value="mumu">MuMu（管理器定位）</option><option value="ios">iPhone / iPad（USB）</option><option value="avd">Android 官方模拟器（AVD）</option></select>
         <p class="mode-description" id="mode-description">先预览路线与速度。预览模式不会向设备发送定位数据。</p>
 
         <div id="android-fields" class="device-fields" hidden>
@@ -96,6 +101,15 @@
           <div class="section-label"><label for="ios-device">USB 设备</label><button class="text-button refresh-button" type="button">刷新</button></div>
           <select id="ios-device"><option value="">请刷新并选择设备</option></select><p class="field-hint">需要解锁并信任此电脑。系统版本、开发者模式、开发者镜像与隧道环境会影响兼容性。</p>
         </div>
+        <div id="harmony-fields" class="device-fields" hidden>
+          <label>HDC 工具路径（可留空自动查找）<input id="hdc-path" type="text" placeholder="HarmonyOS SDK 中的 hdc.exe 完整路径" spellcheck="false"></label>
+          <div class="section-label"><label for="harmony-device">鸿蒙 USB 设备</label><button class="text-button refresh-button" type="button">刷新</button></div>
+          <select id="harmony-device"><option value="">请刷新并选择设备</option></select>
+          <button class="secondary-button full-width" id="harmony-probe" type="button">检测鸿蒙调试能力</button>
+          <button class="secondary-button full-width" id="harmony-clear" type="button">清除鸿蒙模拟</button>
+          <p class="field-hint">需要 HarmonyOS 7+、USB 调试授权和官方 HDC 工具。检测只读取命令支持情况；开始后仍需在手机核对实际定位。无需安装安卓 APK 或鸿蒙应用。尚未完成真机验收。</p>
+          <p class="field-hint">停止时会请求恢复真实定位。断线或程序异常退出后，重新连接同一手机并点击“清除鸿蒙模拟”。</p>
+        </div>
         <div id="mumu-fields" class="device-fields" hidden>
           <button id="detect-mumu" class="secondary-button full-width">查找本机 MuMu</button><label>已启动实例<select id="mumu-instances"><option value="">先查找，再选择实例</option></select></label><label>MuMu 管理器路径<input id="manager" type="text" placeholder="C:\…\MuMuManager.exe" spellcheck="false"></label><label>实例编号<input id="instance" type="number" min="0" max="999" step="1" value="0"></label><p class="field-hint">使用 MuMu 自带定位命令，无需安卓定位助手。先开始跑步定位并核对目标 App 位置，再在目标 App 开始跑步。此模式需要电脑。</p>
         </div>
@@ -103,16 +117,31 @@
         <div id="device-notice" class="device-notice" hidden></div>
         <div class="section-divider"></div>
 
-        <div class="section-label"><h3>跑步状态</h3><span class="status-pill" id="run-state" data-state="idle">尚未开始</span></div>
+        <div class="section-label"><h3>工具回放状态</h3><span class="status-pill" id="run-state" data-state="idle">尚未开始</span></div>
         <div class="progress-head"><strong id="progress-percent">0<span>%</span></strong><span id="progress-distance">0 / 0 米</span></div>
         <div class="progress-track" role="progressbar" aria-label="跑步进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track"><div id="progress-fill"></div></div>
         <div class="run-stats"><div><span>跑步用时</span><strong id="elapsed-time">00:00</strong></div><div><span>当前位置</span><strong id="current-position" class="position-value">—</strong></div></div>
         <button class="primary-button" id="start-button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 4 9 6-9 6Z"/></svg><span>开始预览</span></button>
+        <button class="secondary-button full-width" id="quick-preview-button" type="button" title="只生成模拟轨迹，不连接手机" disabled>快速预览 8 圈</button>
         <div class="playback-controls"><button class="secondary-button" id="pause-button" disabled>暂停跑步</button><button class="secondary-button" id="stop-button" disabled>结束跑步</button></div>
         <button class="secondary-button" id="quit-button" type="button">结束并退出</button>
         <p class="help-text">关闭浏览器标签页不会退出后台，请使用上方退出按钮。</p>
         <p id="send-diagnostics" class="mode-description" aria-live="polite">开始跑步后显示坐标发送状态。</p>
-        <p id="ios-motion-note" class="mode-description" hidden>iOS 接口只设置经纬度，不发送步数、运动传感器或速度字段。请先用 iPhone 地图核对位置变化；乐跑的运动状态不代表 GPS 是否移动。</p>
+        <p id="transmission-diagnostics" class="mode-description" aria-live="polite"></p>
+        <button class="secondary-button" id="diagnostics-export" type="button" disabled>导出本次诊断</button>
+        <p class="help-text">上方里程、用时和速度为工具计算值。诊断不读取微信或乐跑的实际记录，不包含路线坐标和设备标识。</p>
+        <div id="ios-motion-note" class="ios-diagnostics" hidden>
+          <strong>iPhone：位置变化 ≠ 已记录跑步</strong>
+          <p>当前通道只发送经纬度，无法指定手机的速度、方向、定位精度或步数。速度设置仅控制路线坐标移动的快慢。</p>
+          <details><summary>位置在动，但没有轨迹、公里数或配速？</summary>
+            <ol>
+              <li>确认乐跑已进入跑步计时页，并允许微信使用精确位置。先保持微信和小程序在前台测试。</li>
+              <li>核对发送间隔和坐标位移；有长间隔或长时间未发送时，先检查电脑休眠、USB 连接及服务错误。</li>
+              <li>发送连续且位置在动，仍不记轨迹时，问题可能在定位质量、速度字段或目标软件筛选。仅凭工具数据无法确定具体条件。</li>
+              <li>结束模拟并确认真实定位恢复，在同一模式下实际步行作对照；保存 iOS / 微信版本、乐跑现象和诊断文件。</li>
+            </ol>
+          </details>
+        </div>
         <div class="notice" role="status" aria-live="polite" id="notice" hidden></div>
         <div class="compatibility-note"><span aria-hidden="true">i</span><p>跑步定位不代表步道乐跑会认可。真机不支持通用加速度注入；设备支持情况以实际连接结果为准。</p></div>
         <div class="device-footer"><span id="server-status">正在连接本机服务…</span><span id="app-version"></span></div>

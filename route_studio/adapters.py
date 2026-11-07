@@ -278,4 +278,10 @@ def make_adapter(config):
     if mode == "ios":
         from .ios_adapter import IOSAdapter
         return IOSAdapter(config.get("udid", ""))
+    if mode == 'harmony':
+        from .harmony_adapter import HarmonyAdapter
+        interval = config.get('route', {}).get('interval', 1)
+        if not isinstance(interval, (int, float)) or interval < 1:
+            raise ValueError('鸿蒙 testhelper 通道的更新间隔至少为 1 秒。')
+        return HarmonyAdapter(config.get('target'), config.get('hdcPath'))
     raise ValueError("未知输出模式")

@@ -152,6 +152,12 @@ class IOSAdapter:
     in which case close raises instead of claiming the real GPS was restored.
     """
 
+    capabilities = {
+        "coordinates": True, "coordinateSystem": "WGS84",
+        "speed": False, "bearing": False, "accuracy": False,
+        "motion": False, "targetAppFeedback": False,
+    }
+
     def __init__(self, udid: str, *, timeout: float = 8.0, open_timeout: float = 30.0) -> None:
         if not isinstance(udid, str) or not udid.strip():
             raise ValueError("请选择明确的 iPhone UDID。")

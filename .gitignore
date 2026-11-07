@@ -24,3 +24,5 @@ backend/data/
 *.sqlite3-*
 !examples/*.gpx
 !examples/*.geojson
+tests/
+*.md

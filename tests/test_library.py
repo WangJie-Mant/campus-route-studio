@@ -9,6 +9,13 @@ class LibraryTests(unittest.TestCase):
         saved = self.library.save({**self.data, 'route': {**self.data['route'], 'loops': 0}})
         self.assertEqual(RouteLibrary(self.path).load(saved['id'])['route']['loops'], 0)
 
+    def test_random_offset_parameters_persist(self):
+        saved = self.library.save({**self.data, 'motion': {'randomOffset': 2, 'randomSpacing': 30}})
+        motion = RouteLibrary(self.path).load(saved['id'])['motion']
+        self.assertEqual(motion['randomOffset'], 2)
+        self.assertEqual(motion['randomSpacing'], 30)
+        self.assertEqual(motion['randomStyle'], 'track-band-v1')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / 'data' / 'routes.sqlite3'

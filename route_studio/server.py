@@ -58,6 +58,8 @@ class Application:
             return {'entries': self.library.list()}
         if path == "/api/status":
             return {"run": self.playback.status(), "info": {"name": "校园乐跑助手", "version": __version__}}
+        if path == "/api/diagnostics":
+            return {"info": {"version": __version__}, **self.playback.report()}
         if path == "/api/mumu":
             from .mumu import discover_mumu
             with self.device_lock:
@@ -88,10 +90,24 @@ class Application:
             return {"run": self.playback.control(data.get("action"))}
         if path == '/api/tuning':
             return {'run': self.playback.tune(data)}
+        if path == '/api/trace':
+            return self.playback.trace(data.get('after', 0), data.get('runId'))
+        if path == '/api/preview/track':
+            from .preview import preview_track
+            return preview_track(data)
         if path == "/api/import":
             return import_route(data.get("text"), data.get("format"))
         if path == "/api/export":
             return export_route(data)
+        if path in ('/api/harmony/devices', '/api/harmony/probe', '/api/harmony/clear'):
+            from .harmony_adapter import HarmonyAdapter, discover_harmony
+            with self.device_lock:
+                if self.playback.status()['state'] in Playback.ACTIVE:
+                    raise ValueError('请先停止回放，再检测或清除鸿蒙定位')
+                if path == '/api/harmony/devices':
+                    return discover_harmony(data.get('hdcPath'))
+                adapter = HarmonyAdapter(data.get('target'), data.get('hdcPath'))
+                return adapter.probe() if path.endswith('/probe') else adapter.clear()
         if path in ("/api/connect", "/api/android/probe"):
             with self.device_lock:
                 if self.playback.status()["state"] in Playback.ACTIVE:
