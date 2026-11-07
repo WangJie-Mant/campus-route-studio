@@ -1,6 +1,6 @@
 # 校园乐跑助手
 
-使用教程见[tutorial](docs\tutorial.md)
+使用教程见[tutorial](docs/tutorial.md)
 
 > 当前测试版：Windows 0.6.4 安卓免安装 APK 直连，手机独立版 0.6.3。Windows 已通过 Android 15 模拟器运行验收；安卓实体手机与 iOS 尚未验收。见 [运行验收报告](DIRECT_RUNTIME_VALIDATION.md)。
 > Windows 安卓模式已移除手机 APK 依赖，使用 ADB 临时进程；运行时仍有临时文件与进程。详见 [WINDOWS_DIRECT.md](WINDOWS_DIRECT.md)。
