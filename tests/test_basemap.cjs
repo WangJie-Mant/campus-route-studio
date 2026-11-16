@@ -1,7 +1,7 @@
 const {chromium}=require('playwright');
 const fs=require('node:fs');const path=require('node:path');const assert=require('node:assert/strict');
 (async()=>{
-  const browser=await chromium.launch({headless:true});const page=await browser.newPage();
+  const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHANNEL?{channel:process.env.PLAYWRIGHT_CHANNEL}:{})});const page=await browser.newPage();
   const root=path.resolve(__dirname,'..');
   assert.equal(fs.readFileSync(path.join(root,'mobile/assets/basemap.js'),'utf8'),fs.readFileSync(path.join(root,'route_studio/web/basemap.js'),'utf8'));
   const pixel=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aTYQAAAAASUVORK5CYII=','base64');

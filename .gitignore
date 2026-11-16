@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 build/
@@ -24,5 +25,16 @@ backend/data/
 *.sqlite3-*
 !examples/*.gpx
 !examples/*.geojson
-tests/
+tests/*
+!tests/test_sessions.py
+!tests/test_multi_sessions.cjs
 *.md
+
+/inno/
+/inno*.exe
+/innounp*.rar
+/innounp_tmp/
+
+!tests/test_notify.py
+
+README.md

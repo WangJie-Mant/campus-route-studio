@@ -68,7 +68,8 @@ class AndroidDirectTests(unittest.TestCase):
         self.assertFalse(self.launches);self.assertFalse(any('push' in c or 'install' in c for c in self.calls))
 
     def test_probe_does_not_request_mock_operation(self):
-        self.assertTrue(self.adapter.probe()['probe']);self.assertEqual(self.launches[0][-1],'probe')
+        result=self.adapter.probe()
+        self.assertTrue(result['probe']);self.assertIn('手机乐跑单独开始计时',result['message']);self.assertEqual(self.launches[0][-1],'probe')
         self.assertFalse(any('appops' in c for c in self.calls))
 
     def test_denied_start_cleans_temporary_file(self):

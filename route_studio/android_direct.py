@@ -4,16 +4,21 @@ from __future__ import annotations
 import json
 import math
 import os
-from pathlib import Path
 import queue
 import re
 import subprocess
-import sys
 import threading
 import uuid
 
+from .android_artifact import direct_artifact
+
 
 class AndroidDirectAdapter:
+    capabilities = {'coordinates': True, 'coordinateSystem': 'WGS84', 'speed': True,
+                    'bearing': True, 'accuracy': True, 'motion': False,
+                    'targetAppFeedback': False, 'startsTargetRecording': False,
+                    'mockMarkerPreserved': True}
+
     def __init__(self, serial):
         from . import adapters
         self.api = adapters
@@ -31,12 +36,10 @@ class AndroidDirectAdapter:
         return self.api.command([self.adb, '-s', self.serial, *args], timeout=timeout)
 
     def _artifact(self):
-        base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
-        candidates = [base / 'campus-route-direct.jar', base / 'build/campus-route-direct.jar']
-        found = next((path for path in candidates if path.is_file()), None)
-        if found is None:
-            raise self.api.DeviceError('缺少安卓直连组件，请重新安装完整 Windows 版。源码构建请运行 scripts/build_android_bridge.py。')
-        return found
+        try:
+            return direct_artifact()
+        except RuntimeError as exc:
+            raise self.api.DeviceError(str(exc)) from None
 
     def _original_mode(self):
         output = self._adb('shell', 'appops', 'get', '--user', 'current', 'com.android.shell', 'android:mock_location')
@@ -140,7 +143,7 @@ class AndroidDirectAdapter:
             result = self._launch('probe')
             if not result.get('probe'):
                 raise self.api.DeviceError('安卓没有返回有效直连检测结果')
-            result['message'] = '安卓直连基础检测通过，手机不安装 APK。开始时仍会验证定位权限与实际通道。'
+            result['message'] = '安卓直连基础检测通过，手机不安装 APK。电脑仅回放定位，位置刷新不依赖手机计时；需要记录跑步时，请在手机乐跑单独开始计时。开始回放时仍会验证定位权限与实际通道。'
             if result.get('locationEnabled') is False:
                 result['message'] += '请先打开手机系统定位。'
             return result

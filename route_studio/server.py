@@ -18,19 +18,25 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .adapters import adb_path, connect_android, probe_android_direct, list_android_devices
+from .android_artifact import artifact_status
 from .playback import Playback
 from .routes import export_route, import_route
 from .library import RouteLibrary
+from .sessions import ReplaySessions
+from .notify import MilestoneNotifier
 
 
 class Application:
     def __init__(self):
-        self.playback = Playback()
+        self.playback = Playback(notifier=MilestoneNotifier())
+        self.sessions = ReplaySessions(default=self.playback, factory=lambda: Playback(notifier=MilestoneNotifier()))
         self.device_lock = threading.Lock()
         self.library = RouteLibrary()
 
     def devices(self):
-        result = {"android": [], "ios": [], "dependencies": {"adb": False, "ios": False}, "errors": []}
+        direct = artifact_status()
+        result = {"android": [], "ios": [], "dependencies": {"adb": False, "ios": False, "androidDirect": direct['ready']},
+                  "androidDirect": direct, "errors": []}
         try:
             adb_path()
             result["dependencies"]["adb"] = True
@@ -54,12 +60,20 @@ class Application:
         return result
 
     def get(self, path):
+        parts = urlsplit(path)
+        path = parts.path
+        ident = parse_qs(parts.query, keep_blank_values=True).get('sessionId', ['default'])[0]
+        if path == '/api/sessions':
+            return {'sessions': self.sessions.list(full=True)}
+        if path == '/api/session':
+            return self.sessions.get(ident)
         if path == '/api/library':
             return {'entries': self.library.list()}
         if path == "/api/status":
-            return {"run": self.playback.status(), "info": {"name": "校园乐跑助手", "version": __version__}}
+            return {"sessionId": ident, "run": self.sessions.status(ident), "sessions": self.sessions.list(),
+                    "info": {"name": "校园乐跑助手", "version": __version__}}
         if path == "/api/diagnostics":
-            return {"info": {"version": __version__}, **self.playback.report()}
+            return {"info": {"version": __version__}, **self.sessions.worker(ident).report()}
         if path == "/api/mumu":
             from .mumu import discover_mumu
             with self.device_lock:
@@ -77,6 +91,15 @@ class Application:
     def post(self, path, data):
         if not isinstance(data, dict):
             raise ValueError("请求内容应为 JSON 对象")
+        ident = data.get('sessionId', 'default')
+        if 'sessionId' in data:
+            self.sessions.worker(ident)
+        if path == '/api/sessions/create':
+            return self.sessions.create(data.get('name'), data.get('draft'))
+        if path == '/api/sessions/update':
+            return self.sessions.update(ident, name=data.get('name'), draft=data.get('draft'))
+        if path == '/api/sessions/delete':
+            return self.sessions.delete(ident)
         if path == '/api/library/save':
             return self.library.save(data)
         if path == '/api/library/load':
@@ -84,14 +107,19 @@ class Application:
         if path == '/api/library/delete':
             return self.library.delete(data.get('id'))
         if path == "/api/start":
-            with self.device_lock:
-                return {"run": self.playback.start(data)}
+            return {"sessionId": ident, "run": self.sessions.start(ident, data)}
+        if path == '/api/schedule':
+            if not data.get('startAt'):
+                raise ValueError('请选择预约时间')
+            return {"sessionId": ident, "run": self.sessions.start(ident, data, data['startAt'])}
         if path == "/api/control":
-            return {"run": self.playback.control(data.get("action"))}
+            return {"sessionId": ident, "run": self.sessions.control(ident, data.get("action"))}
         if path == '/api/tuning':
-            return {'run': self.playback.tune(data)}
+            if self.sessions.status(ident)['state'] == 'scheduled':
+                raise ValueError('请取消预约后修改参数')
+            return {'run': self.sessions.worker(ident).tune(data)}
         if path == '/api/trace':
-            return self.playback.trace(data.get('after', 0), data.get('runId'))
+            return self.sessions.worker(ident).trace(data.get('after', 0), data.get('runId'))
         if path == '/api/preview/track':
             from .preview import preview_track
             return preview_track(data)
@@ -99,23 +127,35 @@ class Application:
             return import_route(data.get("text"), data.get("format"))
         if path == "/api/export":
             return export_route(data)
+        if path in ("/api/ios/probe", "/api/ios/clear"):
+            from .ios_adapter import check_ios_device
+            with self.sessions.device_operation({'mode': 'ios', 'udid': data.get('udid')}):
+                if 'sessionId' not in data and self.playback.status()['state'] in Playback.ACTIVE:
+                    raise ValueError('请先结束回放，再检查或清除 iPhone / iPad 定位')
+                return check_ios_device(data.get('udid'), clear=path.endswith('/clear'))
         if path in ('/api/harmony/devices', '/api/harmony/probe', '/api/harmony/clear'):
             from .harmony_adapter import HarmonyAdapter, discover_harmony
-            with self.device_lock:
-                if self.playback.status()['state'] in Playback.ACTIVE:
-                    raise ValueError('请先停止回放，再检测或清除鸿蒙定位')
-                if path == '/api/harmony/devices':
+            if path == '/api/harmony/devices':
+                with self.device_lock:
                     return discover_harmony(data.get('hdcPath'))
-                adapter = HarmonyAdapter(data.get('target'), data.get('hdcPath'))
+            with self.sessions.device_operation({'mode': 'harmony', 'target': data.get('target')}):
+                if 'sessionId' not in data and self.playback.status()['state'] in Playback.ACTIVE:
+                    raise ValueError('请先停止回放，再检测或清除鸿蒙定位')
+                adapter = HarmonyAdapter(data.get('target'), data.get('hdcPath'),
+                                         data.get('receiverBundle') if path.endswith('/probe') else None)
                 return adapter.probe() if path.endswith('/probe') else adapter.clear()
         if path in ("/api/connect", "/api/android/probe"):
-            with self.device_lock:
-                if self.playback.status()["state"] in Playback.ACTIVE:
+            target = data.get('address') if path == '/api/connect' else data.get('serial')
+            with self.sessions.device_operation({'mode': 'android', 'serial': target}):
+                if 'sessionId' not in data and self.playback.status()["state"] in Playback.ACTIVE:
                     raise ValueError("请先停止跑步再配置设备")
                 if path == "/api/connect":
                     return connect_android(data.get("address"))
                 return probe_android_direct(data.get("serial"))
         raise LookupError("接口不存在")
+
+    def shutdown(self):
+        self.sessions.shutdown()
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -133,7 +173,7 @@ class LocalServer(ThreadingHTTPServer):
         self.origin = "http://" + self.host_header
 
     def finish(self):
-        self.application.playback.shutdown()
+        self.application.shutdown()
         self.shutdown()
 
 
@@ -190,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if parts.path.startswith("/api/"):
-                self.json_response(200, self.server.application.get(parts.path))
+                self.json_response(200, self.server.application.get(self.path))
                 return
             path = self.server.web_root / ("index.html" if parts.path == "/" else parts.path.lstrip("/"))
             path = path.resolve()
@@ -257,7 +297,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        server.application.playback.shutdown()
+        server.application.shutdown()
         server.server_close()
 
 

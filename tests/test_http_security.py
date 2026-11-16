@@ -13,7 +13,7 @@ class HTTPTests(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
-        self.server.application.playback.shutdown()
+        self.server.application.shutdown()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(2)
@@ -79,6 +79,19 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/harmony/clear', '{"target":"phone"}')[0], 400)
             self.server.application.playback.data['state'] = 'idle'
 
+    def test_android_component_readiness_is_separate_from_adb_device_discovery(self):
+        with patch('route_studio.server.artifact_status', return_value={'ready': False, 'message': '缺少安卓直连组件'}), \
+             patch('route_studio.server.adb_path', return_value='adb'), \
+             patch('route_studio.server.list_android_devices', return_value=[{'serial': 'test-phone', 'state': 'device'}]), \
+             patch('route_studio.server.importlib.util.find_spec', return_value=None):
+            status, raw = self.request('GET', '/api/devices')
+        data = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertTrue(data['dependencies']['adb'])
+        self.assertFalse(data['dependencies']['androidDirect'])
+        self.assertEqual(data['android'][0]['serial'], 'test-phone')
+        self.assertIn('缺少', data['androidDirect']['message'])
+
     def test_file_traversal_and_invalid_json(self):
         self.assertEqual(self.request('GET', '/../README.md')[0], 404)
         self.assertEqual(self.request('POST', '/api/start', '{')[0], 400)
@@ -113,12 +126,51 @@ class HTTPTests(unittest.TestCase):
             probe.assert_called_once_with('phone')
         self.assertEqual(self.request('POST', '/api/android/setup', '{"serial":"phone"}')[0], 404)
 
+    def test_ios_probe_and_recovery_are_scoped_and_blocked_during_replay(self):
+        for operation in ('probe', 'clear'):
+            self.assertEqual(self.request('POST', '/api/ios/' + operation, '{}', auth=False)[0], 403)
+            self.assertEqual(self.request('POST', '/api/ios/' + operation, '{}', origin=False)[0], 403)
+        with patch('route_studio.ios_adapter.check_ios_device', return_value={'transportReady': True}) as check:
+            for operation in ('probe', 'clear'):
+                status, _ = self.request('POST', '/api/ios/' + operation, json.dumps({'udid': 'selected-ipad'}))
+                self.assertEqual(status, 200)
+                check.assert_called_with('selected-ipad', clear=operation == 'clear')
+            check.reset_mock()
+            with patch.object(self.server.application.playback, 'status', return_value={'state': 'paused'}):
+                self.assertEqual(self.request('POST', '/api/ios/clear', json.dumps({'udid': 'selected-ipad'}))[0], 400)
+            check.assert_not_called()
+
     def test_preview_and_local_only(self):
         with self.assertRaises(ValueError):
             LocalServer(('0.0.0.0', 0))
         config = {'mode': 'preview', 'route': {'points': [{'lat': 30, 'lon': 120}, {'lat': 30.001, 'lon': 120}]}}
         self.assertEqual(self.request('POST', '/api/start', json.dumps(config))[0], 200)
         self.assertEqual(self.request('POST', '/api/control', '{"action":"stop"}')[0], 200)
+
+    def test_session_routes_require_auth_and_never_fall_back_to_another_session(self):
+        for path in ('/api/sessions', '/api/session?sessionId=default', '/api/status?sessionId=default'):
+            self.assertEqual(self.request('GET', path, auth=False)[0], 403)
+        for path in ('/api/sessions/create', '/api/sessions/update', '/api/sessions/delete', '/api/schedule'):
+            self.assertEqual(self.request('POST', path, '{}', origin=False)[0], 403)
+        code, raw = self.request('POST', '/api/sessions/create', json.dumps({'name': '第二台设备'}))
+        self.assertEqual(code, 200)
+        ident = json.loads(raw)['id']
+        self.assertEqual(self.request('GET', '/api/session?sessionId=' + ident)[0], 200)
+        self.assertEqual(self.request('GET', '/api/session?sessionId=missing')[0], 400)
+        self.assertEqual(self.request('GET', '/api/status?sessionId=')[0], 400)
+        with patch('route_studio.server.probe_android_direct') as probe:
+            self.assertEqual(self.request('POST', '/api/android/probe', json.dumps({'sessionId': 'missing', 'serial': 'phone'}))[0], 400)
+            probe.assert_not_called()
+        plan = {'mode': 'preview', 'route': {'points': [{'lat': 30, 'lon': 120}, {'lat': 30.001, 'lon': 120}], 'loops': 0}}
+        self.assertEqual(self.request('POST', '/api/start', json.dumps({**plan, 'sessionId': ident}))[0], 200)
+        _, raw = self.request('GET', '/api/status?sessionId=' + ident)
+        state = json.loads(raw)
+        self.assertEqual(state['sessionId'], ident)
+        self.assertEqual(len(state['sessions']), 2)
+        self.assertEqual(json.loads(self.request('GET', '/api/status?sessionId=default')[1])['run']['state'], 'idle')
+        self.assertEqual(self.request('POST', '/api/control', json.dumps({'sessionId': 'missing', 'action': 'stop'}))[0], 400)
+        self.assertEqual(self.request('POST', '/api/sessions/delete', json.dumps({'sessionId': ident}))[0], 400)
+        self.assertEqual(self.request('POST', '/api/control', json.dumps({'sessionId': ident, 'action': 'stop'}))[0], 200)
 
 
 if __name__ == '__main__':

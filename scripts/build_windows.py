@@ -16,37 +16,68 @@ import importlib.util
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def prepare_bridge(sdk):
+    from build_android_bridge import RESOURCE, bridge_current
+    if not bridge_current():
+        subprocess.run([sys.executable, str(ROOT / 'scripts/build_android_bridge.py'), '--sdk', str(sdk)], check=True)
+    return RESOURCE
+
+
+def verify_bundled_bridge(package, reference):
+    sys.path.insert(0, str(ROOT))
+    from route_studio.android_artifact import ARTIFACT_NAME, validate_artifact
+    candidates = [package / '_internal/route_studio/resources' / ARTIFACT_NAME,
+                  package / '_internal' / ARTIFACT_NAME]
+    for candidate in candidates:
+        if candidate.is_file():
+            validate_artifact(candidate)
+            if candidate.read_bytes() == reference.read_bytes():
+                return
+    raise RuntimeError('The frozen runtime is missing the current Android direct component. Rebuild without --skip-freeze.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--iscc', type=Path, required=True)
     parser.add_argument('--sdk', type=Path, default=Path(os.environ.get('ANDROID_HOME', '')))
     parser.add_argument('--output', type=Path, default=ROOT / 'dist')
     parser.add_argument('--skip-freeze', action='store_true', help='Repackage an already compiled runtime')
+    parser.add_argument('--work', type=Path, default=ROOT / 'build', help='Scratch directory for PyInstaller')
     args = parser.parse_args()
     sys.path.insert(0, str(ROOT))
     from route_studio import __version__
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     tools = args.sdk.resolve() / 'platform-tools'
-    bridge = ROOT / 'build/campus-route-direct.jar'
-    if not bridge.is_file() or not (tools / 'adb.exe').is_file():
-        raise RuntimeError('Build the direct DEX JAR with scripts/build_android_bridge.py and install Android platform-tools first.')
+    if not (tools / 'adb.exe').is_file():
+        raise RuntimeError('Install Android platform-tools and pass its SDK root with --sdk.')
+    bridge = prepare_bridge(args.sdk.resolve())
     if not args.skip_freeze:
         subprocess.run([
             sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
             '--onedir', '--windowed', '--name', 'CampusRouteStudio',
             '--paths', str(ROOT), '--distpath', str(output),
-            '--workpath', str(ROOT / 'build/windows'), '--specpath', str(ROOT / 'build'),
+            '--workpath', str(args.work / 'windows'), '--specpath', str(args.work),
             '--add-data', f'{ROOT / "route_studio/web"};route_studio/web',
-            '--add-data', f'{bridge};.',
+            '--add-data', f'{bridge.parent};route_studio/resources',
             '--add-data', f'{ROOT / "examples"};examples',
             '--add-data', f'{tools};platform-tools',
             '--collect-all', 'pymobiledevice3', '--collect-all', 'developer_disk_image',
             '--collect-all', 'pytun_pmd3',
             '--hidden-import', 'route_studio.mumu', '--hidden-import', 'route_studio.ios_adapter',
+            # The build interpreter may carry several Qt bindings; the app uses none of them.
+            '--exclude-module', 'PyQt5', '--exclude-module', 'PyQt6',
+            '--exclude-module', 'PySide2', '--exclude-module', 'PySide6',
+            # Scientific/plotting stacks are pulled in by the development interpreter only.
+            '--exclude-module', 'numpy', '--exclude-module', 'scipy',
+            '--exclude-module', 'pandas', '--exclude-module', 'matplotlib',
+            '--exclude-module', 'pygame', '--exclude-module', 'tkinter',
+            '--exclude-module', 'IPython', '--exclude-module', 'jupyter',
+            '--exclude-module', 'notebook', '--exclude-module', 'numba',
             str(ROOT / 'scripts/windows_entry.py'),
         ], check=True)
     package = output / 'CampusRouteStudio'
+    verify_bundled_bridge(package, bridge)
     # ctypes loads these architecture-specific DLLs by a runtime path, so retain
     # the exact package directory layout, including when repackaging a runtime.
     tunnel_source = Path(importlib.util.find_spec('pytun_pmd3').origin).parent

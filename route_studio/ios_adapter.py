@@ -1,8 +1,9 @@
 """USB iOS developer location playback; tested against pymobiledevice3 10.7.4.
 
 Only latitude/longitude are injected. This interface cannot inject Core Motion,
-speed, or bearing. Pairing, Developer Mode, and DDI mounting are prerequisites;
-this module never enables them or starts an elevated tunnel daemon.
+speed, or bearing. Pairing, Developer Mode, and compatible developer services
+are prerequisites. DDI mounting is OS-dependent; this module never changes
+these settings or starts an elevated tunnel daemon.
 """
 
 from __future__ import annotations
@@ -45,16 +46,30 @@ def _same_device(left: str, right: str) -> bool:
     return left.replace("-", "").lower() == right.replace("-", "").lower()
 
 
+def _device_info(lockdown: Any, udid: str) -> dict[str, Any]:
+    values = getattr(lockdown, "all_values", {})
+    if not isinstance(values, dict):
+        values = {}
+    cellular = values.get("TelephonyCapability")
+    return {
+        "udid": udid, "name": str(lockdown.display_name),
+        "version": str(lockdown.product_version),
+        "deviceClass": str(values.get("DeviceClass", "")),
+        "productType": str(values.get("ProductType", "")),
+        "telephonyCapability": cellular if isinstance(cellular, bool) else None,
+    }
+
+
 def _explain(exc: BaseException) -> str:
     kind = type(exc).__name__
     if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)):
-        return "iOS 操作超时；请检查数据线、手机解锁状态和开发者服务。"
+        return "iPhone / iPad 操作超时；请检查数据线、设备解锁状态和开发者服务。"
     if kind in {"NotPairedError", "PairingDialogResponsePendingError", "UserDeniedPairingError"}:
-        return "iPhone 尚未信任此电脑；请先手动完成信任和配对。"
+        return "iPhone / iPad 尚未信任此电脑；请先手动完成信任和配对。"
     if kind in {"PasswordRequiredError", "DeviceLockedError"}:
-        return "请解锁 iPhone 后重试。"
+        return "请解锁 iPhone / iPad 后重试。"
     if kind in {"NoDeviceConnectedError", "DeviceNotFoundError", "ConnectionFailedToUsbmuxdError"}:
-        return "未连接所选 iPhone；请检查 USB 和 Windows Apple Mobile Device Service。"
+        return "未连接所选 iPhone / iPad；请检查 USB 和 Windows Apple Mobile Device Service。"
     if kind in {"InvalidServiceError", "DeveloperModeIsNotEnabledError"}:
         return "iOS 开发者服务不可用；请手动开启开发者模式（iOS 16+）并挂载 DDI。"
     return str(exc) or kind
@@ -144,7 +159,7 @@ class _LegacyLocation:
 
 
 class IOSAdapter:
-    """Single selected USB iPhone; synchronous open/send/close from one worker.
+    """Single selected USB iPhone or iPad; synchronous calls from one worker.
 
     iOS 17.4+ uses one persistent userspace tunnel. iOS 17.0–17.3.1 requires an
     already-running local tunneld. Pre-17 uses a persistent lockdown connection.
@@ -160,7 +175,7 @@ class IOSAdapter:
 
     def __init__(self, udid: str, *, timeout: float = 8.0, open_timeout: float = 30.0) -> None:
         if not isinstance(udid, str) or not udid.strip():
-            raise ValueError("请选择明确的 iPhone UDID。")
+            raise ValueError("请选择明确的 iPhone / iPad 设备。")
         if not math.isfinite(timeout) or not math.isfinite(open_timeout) or min(timeout, open_timeout) <= 0:
             raise ValueError("超时时间必须为有限正数。")
         self.udid = udid.strip()
@@ -171,6 +186,7 @@ class IOSAdapter:
         self._location: Any = None
         self._needs_clear = False
         self._opened = False
+        self.device_info: dict[str, Any] | None = None
 
     async def _open(self) -> None:
         dep = _dependencies()
@@ -179,10 +195,11 @@ class IOSAdapter:
         if not _same_device(str(lockdown.udid), self.udid):
             raise IOSAdapterError("连接设备与所选 UDID 不匹配，已停止。")
         if not lockdown.paired:
-            raise IOSAdapterError("iPhone 尚未信任此电脑；请先手动完成信任和配对。")
+            raise IOSAdapterError("iPhone / iPad 尚未信任此电脑；请先手动完成信任和配对。")
+        self.device_info = _device_info(lockdown, self.udid)
         numbers = re.findall(r"\d+", str(lockdown.product_version))
         if not numbers:
-            raise IOSAdapterError("无法识别所选 iPhone 的 iOS 版本。")
+            raise IOSAdapterError("无法识别所选设备的 iOS / iPadOS 版本。")
         version = tuple(int(n) for n in (numbers + ["0", "0"])[:3])
         if version < (17, 0, 0):
             self._location = _LegacyLocation(lockdown)
@@ -201,7 +218,7 @@ class IOSAdapter:
                 ) from exc
             choices = next((v for k, v in tunnels.items() if _same_device(k, self.udid)), [])
             if not choices:
-                raise IOSAdapterError("本地 tunneld 中没有所选 UDID；请检查该 iPhone 的隧道。")
+                raise IOSAdapterError("本地 tunneld 中没有所选 UDID；请检查该 iPhone / iPad 的隧道。")
             details = choices[0]
             rsd = dep.rsd((details["tunnel-address"], int(details["tunnel-port"])), name=details.get("interface"))
             self._resources.append(rsd.close)
@@ -236,6 +253,20 @@ class IOSAdapter:
         self._needs_clear = True
         await self._location.set(latitude, longitude)
 
+    def clear(self) -> None:
+        """Explicit recovery, including simulations left by an earlier process.
+
+        A successful stop command does not confirm a fresh real location fix.
+        """
+        if not self._opened or self._runner is None:
+            raise IOSAdapterError("请先打开 iPhone / iPad 连接。")
+        self._needs_clear = True
+        try:
+            self._runner.call(self._location.clear(), self.timeout)
+        except Exception as exc:
+            raise IOSAdapterError("清除模拟定位失败，尚未确认恢复真实定位：" + _explain(exc)) from exc
+        self._needs_clear = False
+
     def send(self, point: dict[str, Any]) -> None:
         if not self._opened or self._runner is None:
             raise IOSAdapterError("请先打开 iOS 连接。")
@@ -259,7 +290,7 @@ class IOSAdapter:
             try:
                 await asyncio.wait_for(self._location.clear(), timeout=self.timeout)
             except BaseException as exc:
-                errors.append("无法确认恢复真实定位；请重新连接所选 iPhone 并执行清除模拟定位：" + _explain(exc))
+                errors.append("无法确认恢复真实定位；请重新连接所选 iPhone / iPad 并执行清除模拟定位：" + _explain(exc))
             finally:
                 self._needs_clear = False
         self._location = None
@@ -288,12 +319,12 @@ class IOSAdapter:
             self._runner = None
 
 
-def list_ios_devices(*, timeout: float = 8.0) -> list[dict[str, str]]:
-    """Discover USB iPhones without initiating new trust/pairing or developer services."""
+def list_ios_devices(*, timeout: float = 8.0) -> list[dict[str, Any]]:
+    """Discover USB Apple devices without new pairing or developer services."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("超时时间必须为有限正数。")
 
-    async def discover() -> list[dict[str, str]]:
+    async def discover() -> list[dict[str, Any]]:
         dep = _dependencies()
         result = []
         seen = set()
@@ -303,8 +334,9 @@ def list_ios_devices(*, timeout: float = 8.0) -> list[dict[str, str]]:
             seen.add(device.serial)
             lockdown = await dep.lockdown(serial=device.serial, autopair=False, connection_type="USB")
             try:
-                result.append({"udid": device.serial, "name": str(lockdown.display_name),
-                               "version": str(lockdown.product_version)})
+                if not _same_device(str(lockdown.udid), device.serial):
+                    raise IOSAdapterError("扫描设备与所选 UDID 不匹配，已停止。")
+                result.append(_device_info(lockdown, device.serial))
             finally:
                 await lockdown.close()
         return result
@@ -316,3 +348,25 @@ def list_ios_devices(*, timeout: float = 8.0) -> list[dict[str, str]]:
         raise IOSAdapterError(_explain(exc)) from exc
     finally:
         runner.stop()
+
+
+def check_ios_device(udid: str, *, clear: bool = False) -> dict[str, Any]:
+    """Check the selected transport; never inject test coordinates implicitly."""
+    adapter = IOSAdapter(udid)
+    try:
+        adapter.open()
+        if clear:
+            adapter.clear()
+        return {
+            "device": adapter.device_info,
+            "transportReady": True, "locationVerified": False,
+            "clearRequested": clear,
+            "capabilities": dict(adapter.capabilities),
+            "message": (
+                "已向所选设备发送清除指令。请在系统地图重新定位；旧画面不代表仍在模拟。若提示当前位置不可用，请保持联网，关闭再开启系统定位服务后重试。"
+                if clear else
+                "所选设备的开发者连接可用，未发送测试坐标。请开始回放后在系统地图核对实际位置；连接成功不代表微信或乐跑已接收。"
+            ),
+        }
+    finally:
+        adapter.close()

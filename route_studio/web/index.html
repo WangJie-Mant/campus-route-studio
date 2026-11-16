@@ -23,6 +23,12 @@
       <div class="header-actions"><span class="local-badge"><i></i>Windows 桌面版</span><button class="icon-button" id="help-button" aria-label="查看使用说明" title="使用说明">?</button></div>
     </header>
 
+    <section class="session-workspace" aria-labelledby="sessions-title">
+      <div class="session-heading"><div><span class="eyebrow">DEVICE WORKSPACE</span><h2 id="sessions-title">设备会话</h2><p id="session-summary" role="status">正在读取会话…</p></div><button id="session-add" class="secondary-button" type="button" disabled>＋ 添加会话</button></div>
+      <div id="session-list" class="session-list" role="group" aria-label="切换设备会话"></div>
+      <div class="session-toolbar"><label for="session-name">当前会话</label><input id="session-name" maxlength="40" value="设备会话 1" aria-label="当前会话名称"><button id="session-rename" class="text-button" type="button" disabled>保存名称</button><button id="session-remove" class="text-button danger-text" type="button" disabled>移除会话</button><span id="session-context">每个会话独立保存路线、设备、进度与预约。</span></div>
+    </section>
+
     <main class="workspace">
       <section class="panel editor-panel" aria-labelledby="route-title">
         <div class="panel-heading"><div><span class="eyebrow">01 / PLAN</span><h1 id="route-title">规划一条路线</h1></div><span class="step-symbol" aria-hidden="true">↗</span></div>
@@ -86,28 +92,39 @@
       </section>
 
       <aside class="panel device-panel" aria-labelledby="device-title">
-        <div class="panel-heading"><div><span class="eyebrow">02 / RUN</span><h2 id="device-title">连接设备与跑步</h2></div><span class="connection-dot" id="connection-dot" aria-hidden="true"></span></div>
+        <div class="panel-heading"><div><span class="eyebrow">02 / RUN</span><h2 id="device-title">连接设备与定位回放</h2></div><span class="connection-dot" id="connection-dot" aria-hidden="true"></span></div>
         <label class="field-label" for="mode">连接方式</label>
-        <select id="mode"><option value="preview">仅在地图预览</option><option value="android">Android（USB 直连，免安装 APK）</option><option value="harmony">鸿蒙 7+（USB 调试，实验性）</option><option value="mumu">MuMu（管理器定位）</option><option value="ios">iPhone / iPad（USB）</option><option value="avd">Android 官方模拟器（AVD）</option></select>
+        <select id="mode"><option value="preview">仅在地图预览</option><option value="android">Android（USB 直连，免安装 APK）</option><option value="harmony">鸿蒙 7+（仅调试版应用）</option><option value="mumu">MuMu（管理器定位）</option><option value="ios">iPhone / iPad（USB）</option><option value="avd">Android 官方模拟器（AVD）</option></select>
         <p class="mode-description" id="mode-description">先预览路线与速度。预览模式不会向设备发送定位数据。</p>
 
         <div id="android-fields" class="device-fields" hidden>
           <div class="section-label"><label for="android-device">ADB 设备</label><button class="text-button refresh-button" type="button">刷新</button></div>
           <select id="android-device"><option value="">请刷新并选择设备</option></select>
           <div id="android-helper"><button class="secondary-button full-width" id="setup-button">检测安卓直连</button><p class="field-hint">开启 USB 调试并授权电脑，手机无需安装 APK。运行时会传入临时定位文件，结束时清理；系统限制以检测结果为准。</p></div>
+          <p class="field-hint">部分手机会提示“Shell 正在使用模拟位置，定位功能不可用”，表示定位正被调试通道接管；单凭这条通知不能判断模拟回放是否失败。系统投递成功也不保证目标应用采用。</p>
+          <p class="field-hint">定位刷新与手机是否开始跑步计时无关。若独立地图变化而微信地图不变，需继续核对微信的位置筛选或缓存；本工具不能强制目标应用采用模拟位置。</p>
           <details id="adb-connect"><summary>连接 MuMu ADB</summary><label>ADB 地址<input id="adb-address" type="text" value="127.0.0.1:16384" placeholder="127.0.0.1:16384" spellcheck="false"></label><button class="secondary-button full-width" id="connect-button">连接此地址</button><p class="field-hint">端口以 MuMu 实例设置为准；不同版本与实例可能不同。</p></details>
         </div>
         <div id="ios-fields" class="device-fields" hidden>
           <div class="section-label"><label for="ios-device">USB 设备</label><button class="text-button refresh-button" type="button">刷新</button></div>
           <select id="ios-device"><option value="">请刷新并选择设备</option></select><p class="field-hint">需要解锁并信任此电脑。系统版本、开发者模式、开发者镜像与隧道环境会影响兼容性。</p>
+          <p id="ios-device-summary" class="field-hint" role="status">请选择要回放的 iPhone 或 iPad。</p>
+          <button class="secondary-button full-width" id="ios-probe" type="button">检查所选设备连接</button>
+          <button class="secondary-button full-width" id="ios-clear" type="button">清除所选设备模拟定位</button>
+          <p id="ios-check-status" class="field-hint" role="status">检查连接不会改变位置。多台设备同时连接时，请核对所选设备。</p>
+          <p class="field-hint">先用 iPad 自带“地图”核对回放，再核对高德与微信。Wi‑Fi 版 iPad 的真实定位依赖网络环境；清除后请重新定位。若提示当前位置不可用，可在“设置 → 隐私与安全性”关闭再开启定位服务，再回地图定位。</p>
         </div>
         <div id="harmony-fields" class="device-fields" hidden>
           <label>HDC 工具路径（可留空自动查找）<input id="hdc-path" type="text" placeholder="HarmonyOS SDK 中的 hdc.exe 完整路径" spellcheck="false"></label>
           <div class="section-label"><label for="harmony-device">鸿蒙 USB 设备</label><button class="text-button refresh-button" type="button">刷新</button></div>
           <select id="harmony-device"><option value="">请刷新并选择设备</option></select>
-          <button class="secondary-button full-width" id="harmony-probe" type="button">检测鸿蒙调试能力</button>
+          <label>接收定位的鸿蒙应用包名<input id="harmony-receiver" type="text" value="com.tencent.wechat" maxlength="255" spellcheck="false" placeholder="例如 com.example.locationtest"></label>
+          <button class="secondary-button full-width" id="harmony-probe" type="button">检测设备与接收应用</button>
           <button class="secondary-button full-width" id="harmony-clear" type="button">清除鸿蒙模拟</button>
-          <p class="field-hint">需要 HarmonyOS 7+、USB 调试授权和官方 HDC 工具。检测只读取命令支持情况；开始后仍需在手机核对实际定位。无需安装安卓 APK 或鸿蒙应用。尚未完成真机验收。</p>
+          <p id="harmony-receiver-status" class="field-hint" role="status">开始前会读取接收应用的调试标记。</p>
+          <p class="field-hint">仅供自行开发的调试版鸿蒙应用测试。系统要求接收应用具备 debug 标记并保持 USB 连接；正式版微信、高德及微信内小程序无法通过此通道接收模拟位置。开启手机开发者模式不会改变应用的 debug 标记。</p>
+          <p class="field-hint">需要 HarmonyOS 7+、USB 调试授权和官方 HDC。检测只读；发现正式版或无法核对应用时，会在开启模拟定位前停止。</p>
+          <p class="field-hint">分段回放 v2：一次提交约 12 秒轨迹，让手机逐点播放。暂停、继续或调速会重建轨迹段；手机生效可能延迟。提交成功不代表地图已刷新。</p>
           <p class="field-hint">停止时会请求恢复真实定位。断线或程序异常退出后，重新连接同一手机并点击“清除鸿蒙模拟”。</p>
         </div>
         <div id="mumu-fields" class="device-fields" hidden>
@@ -120,18 +137,31 @@
         <div class="section-label"><h3>工具回放状态</h3><span class="status-pill" id="run-state" data-state="idle">尚未开始</span></div>
         <div class="progress-head"><strong id="progress-percent">0<span>%</span></strong><span id="progress-distance">0 / 0 米</span></div>
         <div class="progress-track" role="progressbar" aria-label="跑步进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track"><div id="progress-fill"></div></div>
-        <div class="run-stats"><div><span>跑步用时</span><strong id="elapsed-time">00:00</strong></div><div><span>当前位置</span><strong id="current-position" class="position-value">—</strong></div></div>
+        <div class="run-stats"><div><span>回放用时</span><strong id="elapsed-time">00:00</strong></div><div><span>当前位置</span><strong id="current-position" class="position-value">—</strong></div></div>
+        <div class="schedule-controls"><label for="schedule-time">本会话预约时间</label><input id="schedule-time" type="datetime-local" step="60"><button id="schedule-button" class="secondary-button full-width" type="button" disabled>预约定位回放</button><p id="schedule-status" class="field-hint" role="status">按本机时区设置，未来 31 天内一次执行。预约期间请保持电脑唤醒、设备连接及本机程序运行。</p></div>
         <button class="primary-button" id="start-button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 4 9 6-9 6Z"/></svg><span>开始预览</span></button>
         <button class="secondary-button full-width" id="quick-preview-button" type="button" title="只生成模拟轨迹，不连接手机" disabled>快速预览 8 圈</button>
-        <div class="playback-controls"><button class="secondary-button" id="pause-button" disabled>暂停跑步</button><button class="secondary-button" id="stop-button" disabled>结束跑步</button></div>
-        <button class="secondary-button" id="quit-button" type="button">结束并退出</button>
-        <p class="help-text">关闭浏览器标签页不会退出后台，请使用上方退出按钮。</p>
-        <p id="send-diagnostics" class="mode-description" aria-live="polite">开始跑步后显示坐标发送状态。</p>
+        <div class="playback-controls"><button class="secondary-button" id="pause-button" disabled>暂停回放</button><button class="secondary-button" id="stop-button" disabled>结束回放</button></div>
+        <div id="target-recording-note" class="ios-diagnostics" hidden>
+          <strong>先验证地图位置是否更新</strong>
+          <p>电脑开始定位回放后，先在手机地图核对位置变化；这一步不需要手机开始跑步计时。计时为零不能解释地图位置不更新。</p>
+          <details><summary>定位正常后，如何记录手机跑步？</summary>
+            <ol>
+              <li>电脑回放到路线起点，再点电脑“暂停”。</li>
+              <li>在手机乐跑点“开始乐跑”，确认手机用时已经开始计时。</li>
+              <li>回到电脑点“继续”，并在手机核对轨迹和里程。</li>
+            </ol>
+          </details>
+          <p>本工具不读取或启动小程序记录。系统定位投递、地图采用位置和跑步记录是不同状态。</p>
+        </div>
+        <button class="secondary-button" id="quit-button" type="button">停止所有会话并退出</button>
+        <p class="help-text">关闭标签页后任务和预约继续运行；退出程序会停止所有会话并取消预约。</p>
+        <p id="send-diagnostics" class="mode-description" aria-live="polite">开始回放后显示坐标发送状态。</p>
         <p id="transmission-diagnostics" class="mode-description" aria-live="polite"></p>
         <button class="secondary-button" id="diagnostics-export" type="button" disabled>导出本次诊断</button>
         <p class="help-text">上方里程、用时和速度为工具计算值。诊断不读取微信或乐跑的实际记录，不包含路线坐标和设备标识。</p>
         <div id="ios-motion-note" class="ios-diagnostics" hidden>
-          <strong>iPhone：位置变化 ≠ 已记录跑步</strong>
+          <strong>iPhone / iPad：位置变化 ≠ 已记录跑步</strong>
           <p>当前通道只发送经纬度，无法指定手机的速度、方向、定位精度或步数。速度设置仅控制路线坐标移动的快慢。</p>
           <details><summary>位置在动，但没有轨迹、公里数或配速？</summary>
             <ol>

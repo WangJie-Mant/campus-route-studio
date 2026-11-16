@@ -93,14 +93,14 @@
       notify(`已删除“${entry.name}”。`);
     });
   });
-  const ACTIVE_STATES = new Set(['starting', 'running', 'paused', 'stopping']);
-  const STATE_LABELS = {idle: '尚未开始', starting: '正在启动', running: '跑步中', paused: '已暂停', stopping: '正在停止', completed: '跑步完成', error: '跑步异常'};
+  const ACTIVE_STATES = new Set(['scheduled', 'starting', 'running', 'paused', 'stopping']);
+  const STATE_LABELS = {idle: '尚未开始', scheduled: '已预约', starting: '正在启动', running: '回放中', paused: '已暂停', stopping: '正在停止', completed: '回放完成', error: '回放异常'};
   const MODE_DESCRIPTIONS = {
     preview: '先预览路线与速度。预览模式不会向设备发送定位数据。',
-    android: '通过 USB 调试直接连接 Android，手机不安装 APK。开始时验证系统定位通道，结束时移除临时定位。',
+    android: '通过 USB 调试回放 Android 定位，手机不安装 APK。电脑只提供测试坐标，不会自动开始微信或乐跑的跑步记录。结束时移除临时定位。',
     mumu: '通过本机 MuMu 管理器发送定位。不需要定位助手，支持情况取决于管理器版本。',
     ios: '通过 USB 回放经纬度。当前 iOS 通道不发送速度、精度或运动数据，位置移动不能证明乐跑已记录轨迹。',
-    harmony: '实验性 HarmonyOS 7+ 通道，使用华为官方定位调试工具发送经纬度、速度和方向。实际支持取决于设备服务，尚未通过真机验收。',
+    harmony: '鸿蒙官方定位调试仅面向 USB 连接下的调试版应用。正式版微信、地图和微信小程序无法通过此通道接收；开始前会检查接收应用。',
     avd: '面向 Android Studio 官方模拟器。可用模拟器控制台同时模拟定位与运动传感器数据。'
   };
   const DEFAULT_POINTS = [{lat:29.51264659,lon:106.69253011},{lat:29.51204124,lon:106.69388141},{lat:29.51191977,lon:106.69394581},{lat:29.51175158,lon:106.69396727},{lat:29.51162077,lon:106.69392434},{lat:29.51150865,lon:106.69381701},{lat:29.51145258,lon:106.69364529},{lat:29.51148061,lon:106.69348430},{lat:29.51214402,lon:106.69223932},{lat:29.51222811,lon:106.69211053},{lat:29.51236827,lon:106.69209980},{lat:29.51254580,lon:106.69212126},{lat:29.51264858,lon:106.69217493},{lat:29.51264659,lon:106.69253011}];
@@ -123,9 +123,186 @@
   let lastRunError = '';
   let lastCleanupError = '';
   let deviceData = null;
+  let preferredIosUdid = '';
+  let preferredAndroidSerial = '';
+  let preferredHarmonyTarget = '';
   let changeCount = 0;
   let locationMarker = null;
   let followPlayback = false;
+  const SESSION_KEY = 'campus-route-studio:sessions:v1';
+  let selectedSessionId = 'default';
+  let sessionsEnabled = false;
+  let sessionsInitializing = true;
+  let sessionBusy = false;
+  let restoringSession = false;
+  let sessionEpoch = 0;
+  let managedSessions = [];
+  const sessionDrafts = new Map();
+  const sessionSavedRoutes = new Map();
+
+  function captureSessionDraft() {
+    return {saved: snapshotSettings(), points: points.map(point => ({...point})),
+      libraryName: $('library-name').value, libraryId: $('library-select').value,
+      scheduleTime: $('schedule-time').value, savedRoute: sessionSavedRoutes.get(selectedSessionId) || null};
+  }
+
+  function cacheSessions() {
+    if (!sessionsEnabled || restoringSession) return;
+    sessionDrafts.set(selectedSessionId, captureSessionDraft());
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify({selected: selectedSessionId,
+        entries: managedSessions.map(item => ({id: item.id, name: item.name, draft: sessionDrafts.get(item.id) || null}))}));
+    } catch { notify('会话方案无法保存到浏览器，请检查本地存储空间。', true); }
+  }
+
+  function renderSessionCards() {
+    const blocked = busy || deviceBusy || libraryBusy || sessionBusy;
+    $('session-add').disabled = !sessionsEnabled || blocked || managedSessions.length >= 16;
+    $('session-rename').disabled = !sessionsEnabled || blocked;
+    $('session-name').disabled = !sessionsEnabled || blocked;
+    $('session-remove').disabled = !sessionsEnabled || blocked || selectedSessionId === 'default' || isActive();
+    const list = $('session-list');
+    for (const node of Array.from(list.children)) if (!managedSessions.some(item => item.id === node.dataset.sessionId)) node.remove();
+    for (const item of managedSessions) {
+      let card = Array.from(list.children).find(node => node.dataset.sessionId === item.id);
+      if (!card) {
+        card = document.createElement('button'); card.type = 'button'; card.className = 'session-card'; card.dataset.sessionId = item.id;
+        card.append(document.createElement('strong'), document.createElement('small'), document.createElement('span'));
+        card.addEventListener('click', () => selectSession(item.id)); list.append(card);
+      }
+      const state = item.run || {};
+      card.disabled = blocked; card.setAttribute('aria-pressed', String(item.id === selectedSessionId)); card.dataset.state = state.state || 'idle';
+      card.children[0].textContent = item.name;
+      card.children[1].textContent = item.device || '尚未选择设备';
+      card.children[2].textContent = state.state === 'scheduled' ? `已预约 · ${new Date(state.scheduledAt).toLocaleString()}` :
+        `${STATE_LABELS[state.state] || '尚未开始'} · ${distanceText(state.distance || 0)} · ${clockText(state.elapsed)}`;
+      card.title = state.error || state.cleanupError || item.name;
+    }
+    if (sessionsEnabled) {
+      const running = managedSessions.filter(item => ['starting', 'running', 'paused', 'stopping'].includes(item.run?.state)).length;
+      const scheduled = managedSessions.filter(item => item.run?.state === 'scheduled').length;
+      $('session-summary').textContent = `${managedSessions.length} 个独立会话 · ${running} 个任务运行中 · ${scheduled} 个预约`;
+      const current = managedSessions.find(item => item.id === selectedSessionId);
+      $('session-context').textContent = `正在操作：${current?.name || '当前会话'} · 切换会话不会停止其他设备`;
+    }
+  }
+
+  async function persistSessionDraft() {
+    if (!sessionsEnabled) return;
+    cacheSessions();
+    await api('/api/sessions/update', {sessionId: selectedSessionId, draft: sessionDrafts.get(selectedSessionId)});
+  }
+
+  function applySession(item) {
+    restoringSession = true;
+    try {
+      const draft = sessionDrafts.get(item.id) || item.draft;
+      if (draft?.savedRoute) sessionSavedRoutes.set(item.id, draft.savedRoute);
+      Object.entries(DEFAULT_SETTINGS).forEach(([id, value]) => { $(id).value = value; });
+      $('mode').value = 'preview'; $('manager').value = ''; $('hdc-path').value = ''; $('instance').value = '0';
+      $('harmony-receiver').value = 'com.tencent.wechat'; $('adb-address').value = '127.0.0.1:16384'; $('sensor').checked = false;
+      preferredIosUdid = ''; preferredAndroidSerial = ''; preferredHarmonyTarget = '';
+      ['android-device', 'ios-device', 'harmony-device', 'mumu-instances'].forEach(id => { $(id).value = ''; });
+      points = draft?.points ? validatePoints(draft.points) : DEFAULT_POINTS.map(point => ({...point}));
+      if (draft?.saved) applySavedSettings(draft.saved);
+      $('library-name').value = draft?.libraryName || ''; $('library-select').value = draft?.libraryId || '';
+      $('schedule-time').value = draft?.scheduleTime || '';
+      $('session-name').value = item.name;
+      $('notice').hidden = true; lastRunError = ''; lastCleanupError = '';
+      $('ios-check-status').textContent = '请选择设备后检查连接。';
+      $('harmony-receiver-status').textContent = '开始前会读取接收应用的调试标记。';
+      delete $('harmony-receiver-status').dataset.compatible;
+      run = {state: 'idle', elapsed: 0, distance: 0, point: null, ...item.run};
+      staticPreview = null; tracePoints = []; traceRunId = null; traceCursor = 0; traceTruncated = false;
+      setFollow(draft?.saved?.ui?.followPlayback === true);
+      drawTrace(); renderRoute(true); modeChanged(); renderStatus(run); libraryInfo();
+    } finally { restoringSession = false; }
+  }
+
+  async function selectSession(ident) {
+    if (!sessionsEnabled || ident === selectedSessionId || sessionBusy || busy || deviceBusy || libraryBusy) return;
+    sessionBusy = true; updateControls();
+    try {
+      await persistSessionDraft();
+      const item = await api('/api/session?sessionId=' + encodeURIComponent(ident));
+      sessionEpoch++; selectedSessionId = ident;
+      applySession(item); cacheSessions();
+      if (statusPromise) await statusPromise;
+      await refreshStatus();
+    } catch (error) { notify(error.message, true); }
+    finally { sessionBusy = false; updateControls(); }
+  }
+
+  async function initializeSessions() {
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch {}
+    try {
+      const data = await api('/api/sessions', undefined, 8000);
+      managedSessions = data.sessions;
+      if (!Array.isArray(managedSessions) || !managedSessions.length) throw new Error('会话列表无效');
+      const initial = captureSessionDraft();
+      const oldEntries = Array.isArray(cached?.entries) ? cached.entries.slice(0, 16) : [];
+      // A new server restores plans only. Never restore running jobs or old appointments.
+      const restarting = managedSessions.length === 1 && managedSessions[0].id === 'default' &&
+        managedSessions[0].run.state === 'idle' && !managedSessions[0].run.runId && !managedSessions[0].draft;
+      for (const item of managedSessions) {
+        const previous = oldEntries.find(entry => entry.id === item.id);
+        sessionDrafts.set(item.id, previous?.draft || item.draft || (item.id === 'default' ? initial : null));
+      }
+      if (restarting) {
+        const first = oldEntries.find(item => item.id === 'default');
+        if (first?.name) managedSessions[0] = await api('/api/sessions/update', {sessionId: 'default', name: first.name, draft: sessionDrafts.get('default')});
+        for (const previous of oldEntries.filter(item => item.id !== 'default')) {
+          const item = await api('/api/sessions/create', {name: previous.name, draft: previous.draft});
+          managedSessions.push(item); sessionDrafts.set(item.id, previous.draft);
+          if (previous.id === cached.selected) cached.selected = item.id;
+        }
+      }
+      selectedSessionId = managedSessions.some(item => item.id === cached?.selected) ? cached.selected : 'default';
+      sessionsEnabled = true; sessionEpoch++;
+      applySession(managedSessions.find(item => item.id === selectedSessionId));
+      cacheSessions(); renderSessionCards();
+    } catch (error) {
+      $('session-summary').textContent = '多设备会话尚未连接，请重启本机程序后刷新。';
+      if (sessionsEnabled) notify(error.message, true);
+    }
+    sessionsInitializing = false;
+    updateControls();
+    if (['android', 'avd', 'ios', 'harmony'].includes($('mode').value)) refreshDevices();
+    await refreshStatus();
+  }
+
+  $('session-add').addEventListener('click', async () => {
+    if (sessionBusy || busy || deviceBusy || libraryBusy) return;
+    sessionBusy = true; updateControls();
+    try {
+      await persistSessionDraft();
+      const item = await api('/api/sessions/create', {});
+      managedSessions.push(item); sessionEpoch++; selectedSessionId = item.id;
+      applySession(item); cacheSessions();
+      if (statusPromise) await statusPromise;
+      await refreshStatus();
+    } catch (error) { notify(error.message, true); }
+    finally { sessionBusy = false; updateControls(); }
+  });
+  $('session-rename').addEventListener('click', () => action(async () => {
+    const item = await api('/api/sessions/update', {sessionId: selectedSessionId, name: $('session-name').value.trim()});
+    managedSessions = managedSessions.map(old => old.id === item.id ? item : old); cacheSessions(); renderSessionCards();
+  }));
+  $('session-remove').addEventListener('click', async () => {
+    if (isActive() || sessionBusy || busy || selectedSessionId === 'default') return;
+    sessionBusy = true; updateControls();
+    try {
+      const removed = selectedSessionId;
+      await api('/api/sessions/delete', {sessionId: removed});
+      const first = await api('/api/session?sessionId=default');
+      managedSessions = managedSessions.filter(item => item.id !== removed); sessionDrafts.delete(removed); sessionSavedRoutes.delete(removed);
+      selectedSessionId = 'default'; sessionEpoch++; applySession(first); cacheSessions();
+      if (statusPromise) await statusPromise;
+      await refreshStatus();
+    } catch (error) { notify(error.message, true); }
+    finally { sessionBusy = false; updateControls(); }
+  });
 
   // ---- 设置自动保存：改完即存，下次打开自动恢复 ----
   const MOTION_MODES = new Set(['fixed', 'smooth', 'alternating']);
@@ -197,6 +374,10 @@
         adbAddress: $('adb-address').value.trim().slice(0, 255),
         manager: $('manager').value.trim().slice(0, 500),
         hdcPath: $('hdc-path').value.trim().slice(0, 500),
+        harmonyReceiver: $('harmony-receiver').value.trim().slice(0, 255),
+        iosUdid: $('ios-device').value || preferredIosUdid,
+        androidSerial: $('android-device').value || preferredAndroidSerial,
+        harmonyTarget: $('harmony-device').value || preferredHarmonyTarget,
         instance: fieldInteger('instance', 0, 9999, 0),
         sensor: $('sensor').checked,
         followPlayback
@@ -231,6 +412,7 @@
       }
     }
     autoSaveHint();
+    cacheSessions();
     return true;
   }
 
@@ -283,6 +465,10 @@
       if (typeof ui.adbAddress === 'string') $('adb-address').value = ui.adbAddress.slice(0, 255);
       if (typeof ui.manager === 'string') $('manager').value = ui.manager.slice(0, 500);
       if (typeof ui.hdcPath === 'string') $('hdc-path').value = ui.hdcPath.slice(0, 500);
+      if (typeof ui.harmonyReceiver === 'string') $('harmony-receiver').value = ui.harmonyReceiver.slice(0, 255);
+      if (typeof ui.iosUdid === 'string') preferredIosUdid = ui.iosUdid.slice(0, 128);
+      if (typeof ui.androidSerial === 'string') preferredAndroidSerial = ui.androidSerial.slice(0, 160);
+      if (typeof ui.harmonyTarget === 'string') preferredHarmonyTarget = ui.harmonyTarget.slice(0, 160);
       const instance = validInteger(ui.instance, 0, 9999);
       if (instance !== null) $('instance').value = instance;
       $('sensor').checked = ui.sensor === true;
@@ -387,8 +573,46 @@
       notify(error.message, true);
     }
   });
-  const editingLocked = () => busy || isActive();
+  const editingLocked = () => busy || sessionBusy || sessionsInitializing || isActive();
   const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+
+  const MILESTONE_TAG = 'campus-route-milestone';
+  let milestoneRunId = null;
+  let milestoneSeq = 0;
+
+  // 浏览器通知作为兜底：本机服务已经弹出系统通知时不再重复提示。
+  function requestMilestonePermission() {
+    try {
+      if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+    } catch (error) { }
+  }
+
+  function showMilestoneNotice(text) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try {
+        const note = new Notification('校园乐跑助手', {body: text, tag: MILESTONE_TAG});
+        note.onclick = () => { window.focus(); note.close(); };
+        return true;
+      } catch (error) { }
+    }
+    return false;
+  }
+
+  function checkMilestone(status) {
+    const reached = status && status.milestone;
+    if (!status) return;
+    if (status.runId !== milestoneRunId) {
+      // 新一次运行（或刚打开页面）：只记录基线，不补报历史里程碑。
+      milestoneRunId = status.runId;
+      milestoneSeq = reached && reached.seq ? reached.seq : 0;
+      return;
+    }
+    if (!reached || !reached.seq || reached.seq <= milestoneSeq) return;
+    milestoneSeq = reached.seq;
+    if (reached.delivered) return;
+    const text = `已累计 ${(Number(reached.distance) / 1000).toFixed(2)} 公里`;
+    if (!showMilestoneNotice(text)) notify(text);
+  }
 
   function notify(message, error = false) {
     const node = $('notice');
@@ -398,6 +622,10 @@
   }
 
   async function api(path, body, timeout = 30000) {
+    if (sessionsEnabled) {
+      if (['/api/status', '/api/diagnostics'].includes(path)) path += '?sessionId=' + encodeURIComponent(selectedSessionId);
+      if (['/api/start', '/api/schedule', '/api/control', '/api/tuning', '/api/trace', '/api/android/probe', '/api/ios/probe', '/api/ios/clear', '/api/harmony/probe', '/api/harmony/clear', '/api/connect'].includes(path)) body = {...body, sessionId: selectedSessionId};
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
@@ -631,11 +859,13 @@
   }
 
   async function refreshTrace() {
+    const epoch = sessionEpoch;
     if (staticPreview && !isActive()) return;
     if (staticPreview) { staticPreview = null; traceRunId = null; traceCursor = 0; }
-    if (!run.runId || (run.runId === traceRunId && run.sentUpdates <= traceCursor)) return;
+    if (!run.runId || (run.runId === traceRunId && (run.traceVersion ?? run.sentUpdates) <= traceCursor)) return;
     try {
       const data = await api('/api/trace', {runId: traceRunId, after: traceCursor});
+      if (epoch !== sessionEpoch) return;
       if (staticPreview && !isActive()) return;
       if (data.runId !== run.runId) return;
       if (data.reset || traceRunId !== data.runId) {
@@ -650,6 +880,7 @@
       if (tracePoints.length > 20000) { tracePoints = tracePoints.slice(-20000); traceTruncated = true; }
       drawTrace();
     } catch (error) {
+      if (epoch !== sessionEpoch) return;
       $('trace-status').textContent = `模拟轨迹暂未同步：${error.message}。定位发送仍由后台控制。`;
     }
   }
@@ -686,6 +917,7 @@
     const active = isActive();
     const locked = editingLocked();
     $('quick-preview-button').hidden = $('mode').value !== 'preview';
+    $('target-recording-note').hidden = !['android', 'ios', 'mumu', 'avd'].includes(active ? run.mode : $('mode').value);
     $('quick-preview-button').disabled = locked || points.length < 2 || !serverOnline;
     $('loop-mode').disabled = locked;
     $('motion-random-offset').disabled = locked;
@@ -698,8 +930,10 @@
     $('library-update').disabled = libraryBusy || busy || !librarySelected || points.length < 2;
     $('library-delete').disabled = libraryBusy || !librarySelected;
     $('apply-motion').disabled = busy || !['running', 'paused', 'starting'].includes(run.state);
-    ['latitude', 'longitude', 'speed', 'loops', 'mode', 'demo-button', 'import-button', 'load-button', 'android-device', 'ios-device', 'harmony-device', 'hdc-path', 'manager', 'instance', 'sensor', 'adb-address'].forEach(id => { $(id).disabled = locked; });
+    ['latitude', 'longitude', 'speed', 'loops', 'mode', 'demo-button', 'import-button', 'load-button', 'android-device', 'ios-device', 'harmony-device', 'harmony-receiver', 'hdc-path', 'manager', 'instance', 'sensor', 'adb-address'].forEach(id => { $(id).disabled = locked; });
     ['harmony-probe', 'harmony-clear'].forEach(id => { $(id).disabled = locked || deviceBusy || !$('harmony-device').value; });
+    ['ios-probe', 'ios-clear'].forEach(id => { $(id).disabled = locked || deviceBusy || !$('ios-device').value; });
+    updateIosDeviceSummary();
     $('loops').disabled = locked || $('loop-mode').value === 'infinite';
     document.querySelector('.add-button').disabled = locked;
     document.querySelectorAll('.waypoint-remove').forEach(button => { button.disabled = locked; });
@@ -711,22 +945,32 @@
     $('setup-button').disabled = locked || deviceBusy || !$('android-device').value;
     $('connect-button').disabled = locked || deviceBusy;
     document.querySelectorAll('.refresh-button').forEach(button => { button.disabled = locked || deviceBusy; button.textContent = deviceBusy ? '查找中…' : '刷新'; });
-    $('start-button').disabled = busy || active || points.length < 2 || !serverOnline;
-    $('start-button').querySelector('span').textContent = busy && !active ? '正在处理…' : $('mode').value === 'preview' ? '开始预览' : '开始跑步';
+    $('start-button').disabled = busy || active || points.length < 2 || !serverOnline || ($('mode').value === 'ios' && !$('ios-device').value);
+    $('start-button').disabled ||= sessionBusy;
+    $('schedule-button').disabled = !sessionsEnabled || $('start-button').disabled;
+    $('schedule-time').disabled = locked;
+    $('start-button').querySelector('span').textContent = busy && !active ? '正在处理…' : $('mode').value === 'preview' ? '开始预览' : '开始定位回放';
     $('pause-button').disabled = busy || !['running', 'paused'].includes(run.state);
     $('pause-button').textContent = run.state === 'paused' ? '继续' : '暂停';
-    $('stop-button').disabled = busy || !['starting', 'running', 'paused'].includes(run.state);
-    $('diagnostics-export').disabled = busy || !run.mode;
-    $('map-mode-label').textContent = active ? '路线已锁定' : '路线编辑';
-    $('map-tip').lastChild.textContent = active ? '路线跑步中 · 停止后可继续编辑' : '点击地图添加路线点 · 拖动标记调整位置';
+    $('stop-button').disabled = busy || !['scheduled', 'starting', 'running', 'paused'].includes(run.state);
+    $('stop-button').textContent = run.state === 'scheduled' ? '取消本次预约' : '结束回放';
+    $('schedule-status').textContent = run.state === 'scheduled' ? `将于 ${new Date(run.scheduledAt).toLocaleString()} 启动。设备、路线和参数已锁定；可取消后重新设置。` : '按本机时区设置，未来 31 天内一次执行。预约期间请保持电脑唤醒、设备连接及本机程序运行。';
+    $('diagnostics-export').disabled = busy || !run.mode || run.state === 'scheduled';
+    $('map-mode-label').textContent = active ? '方案已锁定' : '路线编辑';
+    $('map-tip').lastChild.textContent = run.state === 'scheduled' ? '等待预约启动 · 取消预约后可继续编辑' : active ? '路线回放中 · 停止后可继续编辑' : '点击地图添加路线点 · 拖动标记调整位置';
     if (markerLayer) markerLayer.eachLayer(marker => {
       if (!marker.dragging) return;
       if (locked) marker.dragging.disable(); else marker.dragging.enable();
     });
+    renderSessionCards();
   }
 
   function renderStatus(next) {
     const previousState = run.state;
+    if (Object.hasOwn(next, 'runId') && next.runId !== run.runId) {
+      staticPreview = null; tracePoints = []; traceRunId = null; traceCursor = 0; traceTruncated = false;
+      drawTrace();
+    }
     run = {...run, ...next};
     if (!STATE_LABELS[run.state]) run.state = 'error';
     const total = Math.max(0, finite(run.totalDistance));
@@ -757,7 +1001,11 @@
     renderTransmission();
     const sent = Number.isFinite(run.sentUpdates) ? run.sentUpdates : null;
     const age = run.lastSendTime ? Math.max(0, (Date.now() / 1000) - run.lastSendTime) : null;
-    $('send-diagnostics').textContent = !run.mode ? '开始跑步后显示坐标发送状态。' : sent === null ? '当前后台尚未支持发送诊断，请停止跑步后重新启动 start.cmd。' : `已${run.mode === 'preview' ? '预览' : '发送'} ${sent} 次坐标${age === null ? ' · 等待首次发送' : ` · 上次${isActive() ? '发送' : '更新'} ${Math.floor(age)} 秒前 · 耗时 ${run.lastSendMs || 0} 毫秒`}。${run.mode === 'preview' ? '预览模式未向手机发送。' : '接口发送成功不等于手机或乐跑确认接收。'}`;
+    $('send-diagnostics').textContent = !run.mode ? '开始回放后显示坐标发送状态。' : sent === null ? '当前后台尚未支持发送诊断，请停止回放后重新启动 start.cmd。' : `已${run.mode === 'preview' ? '预览' : '发送'} ${sent} 次坐标${age === null ? ' · 等待首次发送' : ` · 上次${isActive() ? '发送' : '更新'} ${Math.floor(age)} 秒前 · 耗时 ${run.lastSendMs || 0} 毫秒`}。${run.mode === 'preview' ? '预览模式未向手机发送。' : '接口发送成功不等于手机或乐跑确认接收。'}`;
+    if (run.mode === 'harmony' && run.transport) {
+      $('send-diagnostics').textContent = `分段回放 v2 · 已提交 ${run.transport.submissions} 批轨迹、累计 ${run.transport.queuedPoints} 个计划点${age == null ? '' : ` · 最近提交 ${Math.floor(age)} 秒前`}。手机实际定位更新尚未确认。`;
+    }
+    if (run.state === 'scheduled') $('send-diagnostics').textContent = '已预约，尚未连接设备或发送定位。';
     if (run.point && Number.isFinite(run.point.lat) && Number.isFinite(run.point.lon)) {
       $('current-position').textContent = `${run.point.lat.toFixed(7)}, ${run.point.lon.toFixed(7)}`;
       if (map) {
@@ -782,6 +1030,14 @@
     const node = $('transmission-diagnostics');
     const stats = run.transmission;
     if (!stats) { node.textContent = ''; node.dataset.warning = 'false'; return; }
+    if (run.mode === 'harmony' && run.transport) {
+      const age = run.lastSendTime ? Math.max(0, Date.now() / 1000 - run.lastSendTime) : 0;
+      const stalled = isActive() && age * 1000 > stats.gapThresholdMs;
+      const phase = run.state === 'paused' ? '已暂停，已提交静止轨迹段' : run.state === 'running' ? '按计划推进' : run.state === 'starting' ? '正在启动' : '已停止';
+      node.textContent = `${stalled ? '轨迹续传已超时，请检查连接。' : ''}轨迹段设定间隔 ${run.transport.deviceInterval} 秒 · 最近批次 ${run.transport.batchPoints} 点 · 本机${phase}。批次间等待消费属于正常状态；无手机定位回读。`;
+      node.dataset.warning = String(stalled);
+      return;
+    }
     const age = run.lastSendTime ? Math.max(0, Date.now() / 1000 - run.lastSendTime) : 0;
     const stalled = isActive() && age * 1000 > stats.gapThresholdMs;
     const interval = stats.lastIntervalMs == null ? '等待第二次更新' : `${(stats.lastIntervalMs / 1000).toFixed(2)} 秒`;
@@ -792,16 +1048,21 @@
 
   function refreshStatus() {
     if (statusPromise) return statusPromise;
+    const epoch = sessionEpoch;
     statusPromise = (async () => {
       try {
         const data = await api('/api/status', undefined, 8000);
+        if (epoch !== sessionEpoch) return;
         serverOnline = true;
         $('server-status').textContent = '本机服务已连接';
         $('connection-dot').classList.add('connected');
         $('app-version').textContent = data.info && data.info.version ? `v${data.info.version}` : '';
+        if (sessionsEnabled && Array.isArray(data.sessions)) managedSessions = data.sessions;
         if (data.run) renderStatus(data.run);
+        if (data.run) checkMilestone(data.run);
         await refreshTrace();
       } catch (error) {
+        if (epoch !== sessionEpoch) return;
         serverOnline = false;
         $('server-status').textContent = '本机服务连接中断';
         $('connection-dot').classList.remove('connected');
@@ -812,12 +1073,25 @@
     return statusPromise;
   }
 
+  function updateIosDeviceSummary() {
+    const actual = isActive() && run.mode === 'ios' ? run.device : null;
+    const selected = (deviceData?.ios || []).find(device => device.udid === $('ios-device').value);
+    const device = actual || selected;
+    if (!device) {
+      $('ios-device-summary').textContent = preferredIosUdid ? '上次选择的设备未连接，请重新连接或明确选择另一台设备。' : '请选择要回放的 iPhone 或 iPad。';
+      return;
+    }
+    const os = device.deviceClass === 'iPad' ? 'iPadOS' : 'iOS';
+    const wifi = device.deviceClass === 'iPad' && device.telephonyCapability === false ? ' · 仅 Wi‑Fi 版' : '';
+    $('ios-device-summary').textContent = `${actual ? '本次实际回放设备' : '当前选择'}：${device.name || device.deviceClass || 'Apple 设备'} · ${os} ${device.version || '未知'}${wifi} · ${String(device.udid).slice(0, 8)}…`;
+  }
+
   function populateDevices() {
     if (!deviceData) return;
     const avdOnly = $('mode').value === 'avd';
-    const previousAndroid = $('android-device').value;
-    const previousIos = $('ios-device').value;
-    const previousHarmony = $('harmony-device').value;
+    const previousAndroid = $('android-device').value || preferredAndroidSerial;
+    const previousIos = $('ios-device').value || preferredIosUdid;
+    const previousHarmony = $('harmony-device').value || preferredHarmonyTarget;
     $('android-device').replaceChildren(new Option('请选择已连接设备', ''));
     $('ios-device').replaceChildren(new Option('请选择已连接设备', ''));
     $('harmony-device').replaceChildren(new Option('请选择已连接设备', ''));
@@ -834,22 +1108,29 @@
     });
     if (Array.from($('harmony-device').options).some(option => option.value === previousHarmony && !option.disabled)) $('harmony-device').value = previousHarmony;
     const harmonyAvailable = Array.from($('harmony-device').options).filter(option => option.value && !option.disabled);
-    if (!$('harmony-device').value && harmonyAvailable.length === 1) $('harmony-device').value = harmonyAvailable[0].value;
+    if (!$('harmony-device').value && !previousHarmony && harmonyAvailable.length === 1) $('harmony-device').value = harmonyAvailable[0].value;
     if (deviceData.hdcPath && !$('hdc-path').value.trim()) { $('hdc-path').value = deviceData.hdcPath; saveNow(); }
     if (Array.from($('android-device').options).some(option => option.value === previousAndroid && !option.disabled)) $('android-device').value = previousAndroid;
     if (Array.from($('ios-device').options).some(option => option.value === previousIos)) $('ios-device').value = previousIos;
     const androidAvailable = Array.from($('android-device').options).filter(option => option.value && !option.disabled);
-    if (!$('android-device').value && androidAvailable.length === 1) $('android-device').value = androidAvailable[0].value;
-    if (!$('ios-device').value && $('ios-device').options.length === 2) $('ios-device').selectedIndex = 1;
+    if (!$('android-device').value && !previousAndroid && androidAvailable.length === 1) $('android-device').value = androidAvailable[0].value;
+    for (const [id, previous] of [['android-device', previousAndroid], ['harmony-device', previousHarmony]]) {
+      if (previous && !Array.from($(id).options).some(option => option.value === previous)) {
+        const missing = new Option(`${previous}（未连接）`, previous); missing.disabled = true; $(id).append(missing); $(id).value = previous;
+      }
+    }
+    if (!$('ios-device').value && !previousIos && $('ios-device').options.length === 2) $('ios-device').selectedIndex = 1;
     const messages = [];
     const mode = $('mode').value;
     if (['android', 'avd'].includes(mode)) {
       if (!deviceData.dependencies?.adb) messages.push('未检测到 adb。请安装 Android Platform Tools 并加入 PATH。');
       else if (!androidAvailable.length) messages.push(avdOnly ? '未发现可用 AVD。请在 Android Studio 中启动模拟器。' : '未发现已授权设备。请打开 USB 调试、确认授权，或填写 MuMu ADB 地址。');
+      if (mode === 'android' && deviceData.dependencies?.androidDirect === false) messages.push(deviceData.androidDirect?.message || '本机缺少安卓直连组件，请使用完整程序文件。设备被识别不代表直连组件已就绪。');
     }
     if (mode === 'ios') {
       if (!deviceData.dependencies?.ios) messages.push('iPhone 扫描依赖未安装到当前 Python。请退出后用 start.cmd 重新启动；Apple 驱动已安装也需要此依赖。');
       else if (!$('ios-device').options[1]) messages.push('未发现 iOS 设备。请使用数据线连接、解锁并信任此电脑。');
+      else if (!$('ios-device').value) messages.push(previousIos ? '上次选择的 iPhone / iPad 未连接。请重新连接或明确选择另一台设备；不会自动改向其他设备回放。' : '检测到多台 Apple 设备，请明确选择要回放的 iPhone 或 iPad。');
     }
     if (mode === 'harmony' && !harmonyAvailable.length) messages.push('未发现已授权鸿蒙 USB 设备，请连接并解锁手机、开启 USB 调试，在手机允许此电脑连接。');
     if (['android', 'ios', 'avd', 'harmony'].includes(mode)) (deviceData.errors || []).forEach(error => { messages.push(typeof error === 'string' ? error : error.message || JSON.stringify(error)); });
@@ -859,13 +1140,16 @@
   }
 
   async function refreshDevices() {
-    if (deviceBusy || isActive()) return;
+    if (deviceBusy || sessionBusy || sessionsInitializing || isActive()) return;
+    const epoch = sessionEpoch;
     deviceBusy = true;
     updateControls();
     try {
-      deviceData = $('mode').value === 'harmony' ? await api('/api/harmony/devices', {hdcPath: $('hdc-path').value.trim()}, 60000) : await api('/api/devices', undefined, 60000);
+      const found = $('mode').value === 'harmony' ? await api('/api/harmony/devices', {hdcPath: $('hdc-path').value.trim()}, 60000) : await api('/api/devices', undefined, 60000);
+      if (epoch !== sessionEpoch) return;
+      deviceData = found;
       populateDevices();
-    } catch (error) { notify(error.message, true); }
+    } catch (error) { if (epoch === sessionEpoch) notify(error.message, true); }
     finally { deviceBusy = false; updateControls(); }
   }
 
@@ -939,10 +1223,10 @@
     else notify(found.errors.join('；')||'未找到已启动的 MuMu。请先启动实例，或手动填写路径。',true);
   }));
   $('mode').addEventListener('change', modeChanged);
-  $('android-device').addEventListener('change', updateControls);
+  $('android-device').addEventListener('change', () => { preferredAndroidSerial = $('android-device').value; updateControls(); saveNow(); });
   document.querySelectorAll('.refresh-button').forEach(button => button.addEventListener('click', refreshDevices));
   // 连续输入：合并成一次写入，避免每敲一个键就把整条路线序列化一遍。
-  ['speed', 'loops', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'motion-random-offset', 'motion-random-spacing', 'live-speed', 'manager', 'hdc-path', 'instance', 'adb-address'].forEach(id => $(id).addEventListener('input', scheduleSave));
+  ['speed', 'loops', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'motion-random-offset', 'motion-random-spacing', 'live-speed', 'manager', 'hdc-path', 'harmony-receiver', 'instance', 'adb-address'].forEach(id => $(id).addEventListener('input', scheduleSave));
   ['speed', 'motion-low', 'motion-high', 'motion-period', 'motion-sway', 'motion-sway-period', 'motion-random-offset', 'motion-random-spacing', 'live-speed'].forEach(id => $(id).addEventListener('input', invalidateStaticPreview));
   $('motion-mode').addEventListener('change', invalidateStaticPreview);
   // 离散操作：改完立即写盘，不等防抖。
@@ -956,12 +1240,20 @@
     const data = await api('/api/android/probe', {serial}, 120000);
     notify(data.message || '安卓直连基础检测通过。请开启手机定位，开始后核对实际位置。');
   }));
-  $('harmony-device').addEventListener('change', updateControls);
+  $('harmony-device').addEventListener('change', () => { preferredHarmonyTarget = $('harmony-device').value; updateControls(); saveNow(); });
+  function renderHarmonyReceiver(data) {
+    $('harmony-receiver-status').textContent = data.receiver?.message || data.message;
+    $('harmony-receiver-status').dataset.compatible = String(data.ready === true);
+  }
+  for (const [id, event] of [['harmony-device', 'change'], ['hdc-path', 'input'], ['harmony-receiver', 'input']]) {
+    $(id).addEventListener(event, () => { $('harmony-receiver-status').textContent = '设备或接收应用已变化，请重新检测。'; delete $('harmony-receiver-status').dataset.compatible; });
+  }
   for (const operation of ['probe', 'clear']) $('harmony-' + operation).addEventListener('click', () => action(async () => {
     const target = $('harmony-device').value;
     if (!target) throw new Error('请先选择一台已授权的鸿蒙 USB 设备。');
-    const data = await api('/api/harmony/' + operation, {target, hdcPath: $('hdc-path').value.trim()}, 60000);
-    notify(data.message);
+    const data = await api('/api/harmony/' + operation, {target, hdcPath: $('hdc-path').value.trim(), receiverBundle: $('harmony-receiver').value.trim()}, 60000);
+    if (operation === 'probe') renderHarmonyReceiver(data);
+    notify(data.message, operation === 'probe' && data.ready !== true);
   }));
   $('connect-button').addEventListener('click', () => action(async () => {
     const address = $('adb-address').value.trim();
@@ -970,10 +1262,32 @@
     notify(data.message || 'ADB 连接请求已执行，请查看设备列表中的实际连接状态。');
     await refreshDevices();
   }));
-  $('start-button').addEventListener('click', () => action(async () => {
+  $('ios-device').addEventListener('change', () => {
+    preferredIosUdid = $('ios-device').value;
+    $('ios-check-status').textContent = '所选设备已改变，可重新检查连接。';
+    populateDevices();
+    saveNow();
+  });
+  for (const operation of ['probe', 'clear']) $('ios-' + operation).addEventListener('click', () => action(async () => {
+    const udid = $('ios-device').value;
+    if (!udid) throw new Error('请先选择要检查的 iPhone 或 iPad。');
+    const data = await api('/api/ios/' + operation, {udid}, 60000);
+    const selected = (deviceData?.ios || []).find(device => device.udid === udid);
+    if (selected && data.device) Object.assign(selected, data.device);
+    updateIosDeviceSummary();
+    $('ios-check-status').textContent = data.message;
+    notify(data.message);
+  }));
+  async function beginSession(schedule = false) {
     const mode = $('mode').value;
     const route = settings();
     const payload = {mode, route, motion: motionSettings(), sensor: mode === 'avd' && $('sensor').checked};
+    if (schedule) {
+      const when = new Date($('schedule-time').value);
+      const delay = when.getTime() - Date.now();
+      if (!Number.isFinite(delay) || delay <= 0 || delay > 31 * 86400000) throw new Error('请选择未来 31 天以内的预约时间。');
+      payload.startAt = when.toISOString();
+    }
     if (['android', 'avd'].includes(mode)) {
       payload.serial = $('android-device').value;
       if (!payload.serial) throw new Error('请先刷新并选择一台已授权设备。');
@@ -985,7 +1299,11 @@
     if (mode === 'harmony') {
       payload.target = $('harmony-device').value;
       payload.hdcPath = $('hdc-path').value.trim();
+      payload.receiverBundle = $('harmony-receiver').value.trim();
       if (!payload.target) throw new Error('请先刷新并选择一台鸿蒙 USB 设备。');
+      const check = await api('/api/harmony/probe', {target: payload.target, hdcPath: payload.hdcPath, receiverBundle: payload.receiverBundle}, 60000);
+      renderHarmonyReceiver(check);
+      if (!check.ready) throw new Error(check.message);
     }
     if (mode === 'mumu') {
       payload.manager = $('manager').value.trim();
@@ -995,12 +1313,17 @@
     }
     lastRunError = '';
     lastCleanupError = '';
-    notify(mode === 'preview' ? '正在启动路线预览…' : '正在初始化设备跑步，请稍候…');
-    await api('/api/start', payload, 120000);
+    notify(mode === 'preview' ? '正在启动路线预览…' : '正在初始化定位回放，请稍候…');
+    await persistSessionDraft();
+    await api(schedule ? '/api/schedule' : '/api/start', payload, 120000);
     if (statusPromise) await statusPromise;
     await refreshStatus();
-    if (['running', 'starting'].includes(run.state)) notify(mode === 'preview' ? '路线预览已启动。橙色标记显示服务返回的当前位置。' : '设备跑步已启动，请在设备端核对实际定位效果。');
-  }));
+    if (schedule && run.state === 'scheduled') notify('本会话已预约。切换或关闭页面后预约仍会执行，请保持本机程序运行、电脑唤醒及设备连接。');
+    else if (['running', 'starting'].includes(run.state)) notify(mode === 'preview' ? '路线预览已启动。橙色标记显示服务返回的当前位置。' : '定位回放已启动。电脑不会开始手机跑步记录；请在接收应用中单独开始计时并核对实际位置。');
+  }
+  $('start-button').addEventListener('click', () => { requestMilestonePermission(); action(() => beginSession()); });
+  $('schedule-button').addEventListener('click', () => { requestMilestonePermission(); action(() => beginSession(true)); });
+  $('schedule-time').addEventListener('change', cacheSessions);
   $('pause-button').addEventListener('click', () => action(async () => {
     const command = run.state === 'paused' ? 'resume' : 'pause';
     await api('/api/control', {action: command});
@@ -1009,10 +1332,12 @@
     notify(command === 'pause' ? '跑步已暂停。' : '跑步已继续。');
   }));
   $('stop-button').addEventListener('click', () => action(async () => {
+    const wasScheduled = run.state === 'scheduled';
     await api('/api/control', {action: 'stop'}, 60000);
     if (statusPromise) await statusPromise;
     await refreshStatus();
-    if (!run.cleanupError && !run.error) notify('已发送停止指令。设备模式下，请核对设备定位是否恢复。');
+    if (wasScheduled) notify('已取消本会话预约，其他会话不受影响。');
+    else if (!run.cleanupError && !run.error) notify('已发送停止指令。设备模式下，请核对设备定位是否恢复。');
   }));
   $('import-button').addEventListener('click', () => { if (!editingLocked()) $('import-file').click(); });
   $('import-file').addEventListener('change', () => action(async () => {
@@ -1041,16 +1366,18 @@
   $('save-button').addEventListener('click', () => {
     try {
       const route = settings(false);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({version: 1, savedAt: new Date().toISOString(), route}));
-      notify('当前路线与跑步设置已保存在此浏览器，可通过“读取上次方案”恢复。');
+      const saved = {version: 1, savedAt: new Date().toISOString(), route};
+      if (sessionsEnabled) { sessionSavedRoutes.set(selectedSessionId, saved); cacheSessions(); }
+      else localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+      notify('当前路线与跑步设置已保存到本会话，可通过“读取上次方案”恢复。');
     } catch (error) { notify(`保存失败：${error.message}`, true); }
   });
   $('load-button').addEventListener('click', () => {
     if (editingLocked()) return;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) throw new Error('此浏览器尚未保存路线。');
-      const saved = JSON.parse(raw);
+      const saved = sessionsEnabled && sessionSavedRoutes.has(selectedSessionId) ? sessionSavedRoutes.get(selectedSessionId) :
+        (!sessionsEnabled || selectedSessionId === 'default') ? JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') : null;
+      if (!saved) throw new Error('本会话尚未保存路线。');
       if (saved.version !== 1 || !saved.route) throw new Error('保存的方案格式不受支持。');
       const restored = validatePoints(saved.route.points);
       const speed = Number(saved.route.speed);
@@ -1087,7 +1414,7 @@
   libraryAction(() => refreshLibrary());
   renderRoute(true);
   modeChanged();
-  refreshStatus();
+  initializeSessions();
   setInterval(() => { if (!document.hidden || isActive()) refreshStatus(); }, 1000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
 })();

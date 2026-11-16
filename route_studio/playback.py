@@ -17,8 +17,9 @@ from .diagnostics import TransmissionDiagnostics
 class Playback:
     ACTIVE = {"starting", "running", "paused", "stopping"}
 
-    def __init__(self, factory=make_adapter):
+    def __init__(self, factory=make_adapter, notifier=None):
         self.factory = factory
+        self.notifier = notifier
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.thread = None
@@ -26,12 +27,15 @@ class Playback:
         self.pause_requested = False
         self.shutdown_requested = False
         self.motion = None
+        self.motion_revision = 0
         self.diagnostics = None
         self.trace_points = deque(maxlen=20000)
         self.data = {"state": "idle", "elapsed": 0.0, "distance": 0.0,
                      "totalDistance": 0.0, "duration": 0.0, "point": None, "error": None, "cleanupError": None,
                      "sentUpdates": 0, "lastSendTime": None, "lastSendMs": None,
-                     "transmission": None, "outputCapabilities": None}
+                     "transmission": None, "outputCapabilities": None,
+                     "transport": None, "traceVersion": 0, "playbackTicks": 0, "device": None,
+                     "milestone": None, "milestoneSeq": 0}
 
     def status(self):
         with self.lock:
@@ -53,18 +57,21 @@ class Playback:
             # Explicit allowlist: a support report must not expose route coordinates or UDIDs.
             keys = ("state", "mode", "elapsed", "distance", "totalDistance", "duration",
                     "interval", "motion", "sentUpdates", "lastSendTime", "lastSendMs",
-                    "transmission", "outputCapabilities", "randomSeed")
+                    "transmission", "outputCapabilities", "randomSeed", "transport", "playbackTicks")
             return deepcopy({
                 "schemaVersion": 1,
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "scope": "sender-only",
                 "targetRecording": "unknown",
+                "transportSemantics": "Batch acknowledgements are not device location callbacks.",
                 "notes": [
                     "里程和配速来自工具计算；发送成功不能证明微信或乐跑接收、记录。",
                     "coordinateSpeed 是相邻成功发送坐标的距离/发送间隔，不是手机回传的速度。",
                     "samples 仅保留最近 120 次成功发送；累计统计覆盖本次运行。",
                 ],
                 "run": {**{key: self.data.get(key) for key in keys},
+                        "deviceProfile": {key: value for key, value in (self.data.get('device') or {}).items()
+                                          if key in ('version', 'deviceClass', 'productType', 'telephonyCapability')},
                         "errorPresent": bool(self.data.get("error")),
                         "cleanupErrorPresent": bool(self.data.get("cleanupError"))},
                 "samples": list(self.diagnostics.samples) if self.diagnostics else [],
@@ -82,13 +89,16 @@ class Playback:
             self.stop_requested = False
             self.pause_requested = False
             self.motion = motion
+            self.motion_revision += 1
             self.trace_points.clear()
-            self.diagnostics = TransmissionDiagnostics(route.interval)
+            cadence = max(route.interval, adapter.window_size + 0.5) if callable(getattr(adapter, 'send_window', None)) else route.interval
+            self.diagnostics = TransmissionDiagnostics(cadence)
             self.data.update(state="starting", elapsed=0.0, distance=0.0,
                              totalDistance=None if route.infinite else route.total_distance,
                              duration=None if route.infinite else route.duration,
                              infinite=route.infinite, lapDistance=route.lap_distance, completedLaps=0,
                              point=None, error=None, cleanupError=None, sentUpdates=0, lastSendTime=None, lastSendMs=None,
+                             transport=None, traceVersion=0, playbackTicks=0, device=None,
                              mode=config.get("mode", "preview"),
                              runId=secrets.token_hex(8), randomSeed=str(motion.random_seed),
                              interval=route.interval, transmission=self.diagnostics.summary(),
@@ -107,6 +117,7 @@ class Playback:
             motion = Motion({**(self.motion.as_dict() if self.motion else {}), **data},
                             random_seed=self.motion.random_seed if self.motion else None)
             self.motion = motion
+            self.motion_revision += 1
             self.data['motion'] = motion.as_dict()
             self.condition.notify_all()
         return self.status()
@@ -134,9 +145,12 @@ class Playback:
         # Also initialise when exercised directly by transport-independent tests.
         with self.lock:
             if self.diagnostics is None:
-                self.diagnostics = TransmissionDiagnostics(route.interval)
+                cadence = max(route.interval, adapter.window_size + 0.5) if callable(getattr(adapter, 'send_window', None)) else route.interval
+                self.diagnostics = TransmissionDiagnostics(cadence)
         try:
             adapter.open()
+            with self.lock:
+                self.data['device'] = deepcopy(getattr(adapter, 'device_info', None))
             last = time.monotonic()
             with self.lock:
                 was_paused = self.pause_requested
@@ -173,21 +187,50 @@ class Playback:
                     point['speed'] = 0 if travelled >= route.total_distance else motion.speed_at(elapsed)
                     if paused:
                         point["speed"] = 0.0
+                    revision = (self.motion_revision, paused, travelled >= route.total_distance)
+                    window = None
+                    if callable(getattr(adapter, 'send_window', None)):
+                        window = [point]
+                        for seconds in range(1, adapter.window_size):
+                            future = elapsed if paused else elapsed + seconds
+                            position = min(route.total_distance, travelled + motion.integral(future) - motion.integral(elapsed))
+                            fix, _ = route.at(position / route.speed)
+                            fix = motion.offset(fix, future, position, route.total_distance, route)
+                            fix['speed'] = 0.0 if paused or position >= route.total_distance else motion.speed_at(future)
+                            window.append(fix)
                 send_started = time.perf_counter()
-                adapter.send(point)
+                submitted = adapter.send_window(window, key=revision) if window is not None else adapter.send(point)
+                submitted = submitted is not False
                 sent_at = time.monotonic()
                 send_ms = (time.perf_counter() - send_started) * 1000
                 with self.condition:
-                    self.diagnostics.record(point, sent_at, send_ms, elapsed, travelled)
+                    if submitted:
+                        self.diagnostics.record(point, sent_at, send_ms, elapsed, travelled)
                     self.data.update(elapsed=elapsed, distance=travelled, point=point,
                                      completedLaps=min(route.loops, int(travelled / route.lap_distance)) if not route.infinite else int(travelled / route.lap_distance),
-                                     sentUpdates=self.data["sentUpdates"] + 1,
-                                     lastSendTime=time.time(), lastSendMs=round(send_ms),
+                                     sentUpdates=self.data["sentUpdates"] + int(submitted),
+                                     traceVersion=self.data['traceVersion'] + 1,
+                                     playbackTicks=self.data['playbackTicks'] + 1,
                                      transmission=self.diagnostics.summary())
-                    self.trace_points.append({'seq': self.data['sentUpdates'],
+                    if submitted:
+                        self.data.update(lastSendTime=time.time(), lastSendMs=round(send_ms))
+                    if callable(getattr(adapter, 'transport_status', None)):
+                        self.data['transport'] = adapter.transport_status()
+                    self.trace_points.append({'seq': self.data['traceVersion'],
                                               'lat': point['lat'], 'lon': point['lon'],
                                               'lap': int(travelled / route.lap_distance),
                                               'elapsed': elapsed})
+                    if self.notifier is not None:
+                        try:
+                            crossed = self.notifier.check(travelled, self.data.get('runId'))
+                        except Exception:
+                            crossed = []
+                        for item in crossed:
+                            self.data['milestoneSeq'] = int(self.data.get('milestoneSeq') or 0) + 1
+                            self.data['milestone'] = {'distance': item['distance'],
+                                                      'delivered': bool(item['delivered']),
+                                                      'seq': self.data['milestoneSeq'],
+                                                      'at': time.time()}
                     if self.stop_requested:
                         break
                     self.data["state"] = "paused" if paused else "running"
@@ -209,6 +252,8 @@ class Playback:
                 with self.lock:
                     self.data["cleanupError"] = str(exc)
             with self.lock:
+                if callable(getattr(adapter, 'transport_status', None)):
+                    self.data['transport'] = adapter.transport_status()
                 self.data["state"] = final
 
     def shutdown(self):

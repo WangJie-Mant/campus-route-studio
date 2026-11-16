@@ -1,0 +1,79 @@
+name: Windows 打包与发布
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装构建依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pymobiledevice3==10.7.4
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 下载 Android platform-tools（内置 ADB）
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile platform-tools.zip
+          Expand-Archive platform-tools.zip -DestinationPath android-sdk -Force
+          if (-not (Test-Path .\android-sdk\platform-tools\adb.exe)) { throw "platform-tools 解压失败" }
+
+      - name: 读取版本号
+        id: version
+        shell: pwsh
+        run: |
+          $v = python -c "import route_studio; print(route_studio.__version__)"
+          "value=$v" >> $env:GITHUB_OUTPUT
+
+      - name: 校验标签与版本号一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $v = "${{ steps.version.outputs.value }}".Trim()
+          if ($tag -ne $v) { throw "标签 v$tag 与 route_studio.__version__ $v 不一致" }
+
+      - name: 单元测试（先不阻止发布）
+        continue-on-error: true
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: 构建运行时、安装包与便携 ZIP
+        shell: pwsh
+        run: |
+          python scripts/build_windows.py --sdk "${{ github.workspace }}\android-sdk" --iscc "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" --output dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: CampusRouteStudio-Windows-${{ steps.version.outputs.value }}
+          path: |
+            dist/CampusRouteStudio-Windows-Setup-*.exe
+            dist/CampusRouteStudio-Windows.zip
+          if-no-files-found: error
+
+      - name: 发布 Release（仅 v* 标签触发）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 校园乐跑助手 ${{ steps.version.outputs.value }}
+          generate_release_notes: true
+          files: |
+            dist/CampusRouteStudio-Windows-Setup-*.exe
+            dist/CampusRouteStudio-Windows.zip

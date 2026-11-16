@@ -14,6 +14,7 @@ class Fixture:
         self.calls = []
         self.lockdown = SimpleNamespace(
             udid="selected-phone", paired=True, product_version=version,
+            all_values={"DeviceClass": "iPhone", "ProductType": "iPhone16,1", "TelephonyCapability": True},
             display_name="Test iPhone", close=AsyncMock(side_effect=lambda: self.calls.append("lockdown.close")),
         )
         self.rsd = SimpleNamespace(
@@ -162,10 +163,44 @@ class IOSAdapterTests(unittest.TestCase):
         ]
         with patch.object(ios, "_dependencies", return_value=fixture.dep):
             self.assertEqual(ios.list_ios_devices(), [
-                {"udid": "selected-phone", "name": "Test iPhone", "version": "17.4"}])
+                {"udid": "selected-phone", "name": "Test iPhone", "version": "17.4",
+                 "deviceClass": "iPhone", "productType": "iPhone16,1", "telephonyCapability": True}])
         fixture.dep.lockdown.assert_awaited_once_with(
             serial="selected-phone", autopair=False, connection_type="USB")
         fixture.dep.tunnel.assert_not_called()
+
+
+    def test_ipad_probe_identifies_wifi_model_without_mutating_location(self):
+        fixture = Fixture('27.0.1')
+        fixture.lockdown.display_name = 'Test iPad'
+        fixture.lockdown.all_values = {"DeviceClass": "iPad", "ProductType": "iPad16,3", "TelephonyCapability": False}
+        with patch.object(ios, '_dependencies', return_value=fixture.dep):
+            result = ios.check_ios_device('selected-phone')
+        self.assertEqual(result['device']['deviceClass'], 'iPad')
+        self.assertFalse(result['device']['telephonyCapability'])
+        self.assertTrue(result['transportReady'])
+        self.assertFalse(result['locationVerified'])
+        fixture.location.set.assert_not_awaited()
+        fixture.location.clear.assert_not_awaited()
+        fixture.dvt.close.assert_awaited_once()
+
+    def test_explicit_clear_cleans_simulation_from_previous_process(self):
+        fixture = Fixture()
+        with patch.object(ios, '_dependencies', return_value=fixture.dep):
+            result = ios.check_ios_device('selected-phone', clear=True)
+        self.assertTrue(result['clearRequested'])
+        self.assertFalse(result['locationVerified'])
+        fixture.location.set.assert_not_awaited()
+        fixture.location.clear.assert_awaited_once()
+
+    def test_probe_never_falls_back_to_another_device(self):
+        fixture = Fixture()
+        fixture.lockdown.udid = 'other-phone'
+        with patch.object(ios, '_dependencies', return_value=fixture.dep):
+            with self.assertRaisesRegex(ios.IOSAdapterError, '不匹配'):
+                ios.check_ios_device('selected-ipad')
+        fixture.dep.tunnel.assert_not_called()
+        fixture.location.set.assert_not_awaited()
 
 
 if __name__ == "__main__":

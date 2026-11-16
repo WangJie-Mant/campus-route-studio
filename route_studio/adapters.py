@@ -283,5 +283,5 @@ def make_adapter(config):
         interval = config.get('route', {}).get('interval', 1)
         if not isinstance(interval, (int, float)) or interval < 1:
             raise ValueError('鸿蒙 testhelper 通道的更新间隔至少为 1 秒。')
-        return HarmonyAdapter(config.get('target'), config.get('hdcPath'))
+        return HarmonyAdapter(config.get('target'), config.get('hdcPath'), config.get('receiverBundle'))
     raise ValueError("未知输出模式")

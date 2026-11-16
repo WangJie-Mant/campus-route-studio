@@ -54,6 +54,46 @@ class ScriptedCondition:
 
 
 class PlaybackTests(unittest.TestCase):
+    def test_segmented_sender_forecasts_motion_and_keeps_trace_between_uploads(self):
+        worker = module.Playback()
+        clock = [0.0]
+        class WindowAdapter(FakeAdapter):
+            window_size = 12
+            def __init__(self):
+                super().__init__()
+                self.windows = []; self.last_key = None
+            def send(self, point):
+                raise AssertionError('window adapter must not fall back to single-point sends')
+            def send_window(self, points, *, key):
+                if key == self.last_key:
+                    return False
+                self.last_key = key
+                self.windows.append(deepcopy(points))
+                return True
+            def transport_status(self):
+                return {'submissions': len(self.windows)}
+        adapter = WindowAdapter()
+        def step(moment, action=None):
+            def run():
+                clock[0] = moment
+                if action:
+                    worker.control(action)
+            return run
+        worker.condition = ScriptedCondition(worker, [step(1), step(2, 'pause'), step(3), step(4, 'resume'), step(5, 'stop')])
+        with patch.object(module, 'time', SimpleNamespace(monotonic=lambda: clock[0], perf_counter=lambda: clock[0], time=lambda: clock[0])):
+            worker._run(Route(POINTS, speed=2, loops=0), adapter)
+        self.assertEqual(len(adapter.windows), 3)
+        self.assertGreater(adapter.windows[0][-1]['lon'], adapter.windows[0][0]['lon'])
+        self.assertTrue(all(p == adapter.windows[1][0] for p in adapter.windows[1]))
+        self.assertEqual(adapter.windows[1][0]['speed'], 0)
+        self.assertGreater(adapter.windows[2][-1]['lon'], adapter.windows[2][0]['lon'])
+        state = worker.status()
+        self.assertEqual(state['sentUpdates'], 3)
+        self.assertEqual(state['traceVersion'], 5)
+        self.assertEqual(state['playbackTicks'], 5)
+        self.assertEqual(len(worker.trace()['points']), 5)
+        self.assertEqual(len(worker.report()['samples']), 3)
+
     def test_infinite_replay_crosses_laps_without_completing_and_stops(self):
         import json
         worker, adapter = module.Playback(), FakeAdapter()
@@ -217,18 +257,22 @@ class PlaybackTests(unittest.TestCase):
         clock = [0.0]
         worker.data.update(mode='ios', udid='private-phone', interval=1,
                            error='private-phone at lat=30 lon=120')
+        adapter.device_info = {'udid': 'private-phone', 'name': 'private-name',
+                               'deviceClass': 'iPad', 'version': '27.0.1', 'telephonyCapability': False}
         worker.condition = ScriptedCondition(worker, [
             lambda: clock.__setitem__(0, 5), lambda: worker.control('stop')])
         with patch.object(module, 'time', SimpleNamespace(monotonic=lambda: clock[0], perf_counter=lambda: clock[0], time=lambda: clock[0])):
             worker._run(Route(POINTS, speed=2), adapter)
         report = worker.report()
+        self.assertEqual(worker.status()['device']['udid'], 'private-phone')
+        self.assertEqual(report['run']['deviceProfile'], {'deviceClass': 'iPad', 'version': '27.0.1', 'telephonyCapability': False})
         self.assertEqual(report['targetRecording'], 'unknown')
         self.assertTrue(report['run']['errorPresent'])
         self.assertEqual(report['run']['transmission']['longGaps'], 1)
         self.assertAlmostEqual(report['run']['transmission']['sentDistance'], 10, places=5)
         self.assertEqual(len(report['samples']), 2)
         encoded = json.dumps(report, allow_nan=False)
-        for private_field in ('"lat"', '"lon"', '"udid"', 'private-phone'):
+        for private_field in ('"lat"', '"lon"', '"udid"', 'private-phone', 'private-name'):
             self.assertNotIn(private_field, encoded)
         report['run']['transmission']['longGaps'] = 99
         self.assertEqual(worker.report()['run']['transmission']['longGaps'], 1)
